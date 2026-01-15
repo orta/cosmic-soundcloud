@@ -43,6 +43,25 @@ just rootdir=debian/cosmic-soundcloud prefix=/usr install
 
 It is recommended to build a source tarball with the vendored dependencies, which can typically be done by running `just vendor` on the host system before it enters the build environment.
 
+## How Audio Playback Works
+
+The app uses a background audio player thread that receives commands via async channels. Here's the playback flow:
+
+1. Stream URL Resolution: When you play a track, the app requests stream URLs from SoundCloud's API. Tracks have multiple "transcodings" (stream formats) - the app prefers HLS streams, then progressive (direct) streams.
+
+2. Audio Player: The [`AudioPlayer`](src/audio/player.rs) runs in a dedicated thread using [rodio][rodio] for audio output. It communicates with the main app via `AudioCommand` and `AudioEvent` message channels.
+
+3. Stream Types:
+
+   - Progressive streams: Direct MP3/MP4 files streamed using [`stream-download`][stream-download] for buffered playback
+   - HLS streams: The app downloads all `.m3u8` playlist segments, concatenates them in memory, then decodes and plays the result
+
+4. **DRM Handling**: Some tracks use encrypted HLS (PlayReady/Widevine DRM). When detected, the app falls back to [yt-dlp][yt-dlp] to extract an unencrypted stream URL. If that fails, it offers to open the track in your browser.
+
+[rodio]: https://github.com/RustAudio/rodio
+[stream-download]: https://github.com/aschey/stream-download-rs
+[yt-dlp]: https://github.com/yt-dlp/yt-dlp
+
 ## Developers
 
 Developers should install [rustup][rustup] and configure their editor to use [rust-analyzer][rust-analyzer]. To improve compilation times, disable LTO in the release profile, install the [mold][mold] linker, and configure [sccache][sccache] for use with Rust. The [mold][mold] linker will only improve link times if LTO is disabled.
