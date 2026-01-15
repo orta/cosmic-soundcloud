@@ -9,9 +9,9 @@ use cosmic::cosmic_config::{self, CosmicConfigEntry};
 use cosmic::iced::alignment::{Horizontal, Vertical};
 use cosmic::iced::futures::SinkExt;
 use cosmic::iced::{Alignment, Length, Subscription};
-use cosmic::widget::{self, about::About, icon, menu, nav_bar, segmented_button};
+use cosmic::widget::{self, about::About, icon, image, menu, nav_bar, segmented_button};
 use cosmic::{iced_futures, prelude::*, Element};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc;
 
 const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
@@ -131,6 +131,10 @@ pub struct AppModel {
     current_playlist: Vec<Track>,
     playlist_index: usize,
     volume: f32,
+
+    // === Artwork Cache ===
+    artwork_cache: HashMap<String, image::Handle>,
+    artwork_loading: HashSet<String>,
 }
 
 /// Messages emitted by the application and its widgets.
@@ -172,6 +176,10 @@ pub enum Message {
     NextTrack,
     PreviousTrack,
     SetVolume(f32),
+
+    // Artwork
+    LoadArtwork(String),
+    ArtworkLoaded(String, Vec<u8>),
 }
 
 /// Create a COSMIC application from the app model
@@ -258,6 +266,8 @@ impl cosmic::Application for AppModel {
             current_playlist: Vec::new(),
             playlist_index: 0,
             volume,
+            artwork_cache: HashMap::new(),
+            artwork_loading: HashSet::new(),
         };
 
         // If we have a token, fetch user info
@@ -518,8 +528,24 @@ impl cosmic::Application for AppModel {
                 self.likes.loading = false;
                 match result {
                     Ok((tracks, next_href)) => {
+                        // Queue artwork loading for new tracks
+                        let artwork_urls: Vec<_> = tracks
+                            .iter()
+                            .filter_map(|t| t.artwork_url.clone())
+                            .filter(|url| !self.artwork_cache.contains_key(url) && !self.artwork_loading.contains(url))
+                            .collect();
+
                         self.likes.items.extend(tracks);
                         self.likes.next_href = next_href;
+
+                        // Load artwork
+                        if !artwork_urls.is_empty() {
+                            let tasks: Vec<Task<cosmic::Action<Message>>> = artwork_urls
+                                .into_iter()
+                                .map(|url| cosmic::task::message(cosmic::Action::App(Message::LoadArtwork(url))))
+                                .collect();
+                            return cosmic::task::batch(tasks);
+                        }
                     }
                     Err(err) => {
                         eprintln!("Failed to load likes: {err}");
@@ -546,8 +572,24 @@ impl cosmic::Application for AppModel {
                 self.history.loading = false;
                 match result {
                     Ok((tracks, next_href)) => {
+                        // Queue artwork loading for new tracks
+                        let artwork_urls: Vec<_> = tracks
+                            .iter()
+                            .filter_map(|t| t.artwork_url.clone())
+                            .filter(|url| !self.artwork_cache.contains_key(url) && !self.artwork_loading.contains(url))
+                            .collect();
+
                         self.history.items.extend(tracks);
                         self.history.next_href = next_href;
+
+                        // Load artwork
+                        if !artwork_urls.is_empty() {
+                            let tasks: Vec<Task<cosmic::Action<Message>>> = artwork_urls
+                                .into_iter()
+                                .map(|url| cosmic::task::message(cosmic::Action::App(Message::LoadArtwork(url))))
+                                .collect();
+                            return cosmic::task::batch(tasks);
+                        }
                     }
                     Err(err) => {
                         eprintln!("Failed to load history: {err}");
@@ -576,16 +618,25 @@ impl cosmic::Application for AppModel {
                 self.playlist_index = index;
                 self.playback_status = PlaybackStatus::Buffering;
 
+                // Load artwork if not cached
+                let mut tasks = Vec::new();
+                if let Some(artwork_url) = &track.artwork_url {
+                    if !self.artwork_cache.contains_key(artwork_url) && !self.artwork_loading.contains(artwork_url) {
+                        tasks.push(cosmic::task::message(cosmic::Action::App(Message::LoadArtwork(artwork_url.clone()))));
+                    }
+                }
+
                 // Fetch stream URL and play
                 if let Some(client) = &self.api_client {
                     let client = client.clone();
-                    return cosmic::task::future(async move {
+                    tasks.push(cosmic::task::future(async move {
                         match client.get_stream_url(&track).await {
                             Ok(url) => Message::StreamUrlLoaded(Ok(url)),
                             Err(e) => Message::StreamUrlLoaded(Err(e.to_string())),
                         }
                     })
-                    .map(cosmic::Action::App);
+                    .map(cosmic::Action::App));
+                    return cosmic::task::batch(tasks);
                 }
             }
 
@@ -726,6 +777,31 @@ impl cosmic::Application for AppModel {
                     let _ = self.config.write_entry(&config_context);
                 }
             }
+
+            // === Artwork ===
+            Message::LoadArtwork(url) => {
+                if !self.artwork_cache.contains_key(&url) && !self.artwork_loading.contains(&url) {
+                    self.artwork_loading.insert(url.clone());
+                    return cosmic::task::future(async move {
+                        match reqwest::get(&url).await {
+                            Ok(response) => match response.bytes().await {
+                                Ok(bytes) => Message::ArtworkLoaded(url, bytes.to_vec()),
+                                Err(_) => Message::ArtworkLoaded(url, Vec::new()),
+                            },
+                            Err(_) => Message::ArtworkLoaded(url, Vec::new()),
+                        }
+                    })
+                    .map(cosmic::Action::App);
+                }
+            }
+
+            Message::ArtworkLoaded(url, data) => {
+                self.artwork_loading.remove(&url);
+                if !data.is_empty() {
+                    self.artwork_cache
+                        .insert(url, image::Handle::from_bytes(data));
+                }
+            }
         }
         Task::none()
     }
@@ -771,12 +847,26 @@ impl AppModel {
 
         // Left: Track info
         let track_info: Element<_> = if let Some(track) = &self.current_track {
-            widget::row::with_capacity(2)
-                .push(
+            let artwork: Element<_> = if let Some(artwork_url) = &track.artwork_url {
+                if let Some(handle) = self.artwork_cache.get(artwork_url) {
+                    widget::image(handle.clone())
+                        .width(Length::Fixed(64.0))
+                        .height(Length::Fixed(64.0))
+                        .content_fit(cosmic::iced::ContentFit::Cover)
+                        .into()
+                } else {
                     widget::icon::from_name("audio-x-generic-symbolic")
-                        .size(48)
-                        .apply(Element::from),
-                )
+                        .size(64)
+                        .apply(Element::from)
+                }
+            } else {
+                widget::icon::from_name("audio-x-generic-symbolic")
+                    .size(64)
+                    .apply(Element::from)
+            };
+
+            widget::row::with_capacity(2)
+                .push(artwork)
                 .push(
                     widget::column::with_capacity(2)
                         .push(widget::text::body(&track.title))
@@ -1053,7 +1143,7 @@ impl AppModel {
         widget::scrollable(content).into()
     }
 
-    fn view_track_item<'a>(&'a self, track: &'a Track) -> Element<'a, Message> {
+    fn view_track_item(&self, track: &Track) -> Element<'_, Message> {
         let space_s = cosmic::theme::spacing().space_s;
 
         // Highlight currently playing track
@@ -1062,21 +1152,47 @@ impl AppModel {
             .as_ref()
             .map_or(false, |t| t.id == track.id);
 
-        let icon_name = if is_playing && self.playback_status == PlaybackStatus::Playing {
-            "media-playback-start-symbolic"
+        // Get artwork element
+        let artwork: Element<_> = if let Some(artwork_url) = &track.artwork_url {
+            if let Some(handle) = self.artwork_cache.get(artwork_url) {
+                widget::image(handle.clone())
+                    .width(Length::Fixed(48.0))
+                    .height(Length::Fixed(48.0))
+                    .content_fit(cosmic::iced::ContentFit::Cover)
+                    .into()
+            } else {
+                // Show placeholder while loading
+                let icon_name = if is_playing && self.playback_status == PlaybackStatus::Playing {
+                    "media-playback-start-symbolic"
+                } else {
+                    "audio-x-generic-symbolic"
+                };
+                widget::icon::from_name(icon_name)
+                    .size(48)
+                    .apply(Element::from)
+            }
         } else {
-            "audio-x-generic-symbolic"
+            // No artwork URL - show icon
+            let icon_name = if is_playing && self.playback_status == PlaybackStatus::Playing {
+                "media-playback-start-symbolic"
+            } else {
+                "audio-x-generic-symbolic"
+            };
+            widget::icon::from_name(icon_name)
+                .size(48)
+                .apply(Element::from)
         };
 
-        let artwork = widget::icon::from_name(icon_name)
-            .size(48)
-            .apply(Element::from);
+        let title = track.title.clone();
+        let username = track.user.username.clone();
+        let duration_text = track.duration_formatted();
+        let track_clone = track.clone();
 
         let info = widget::column::with_capacity(2)
-            .push(widget::text::body(&track.title))
-            .push(widget::text::caption(&track.user.username));
+            .push(widget::text::body(title))
+            .push(widget::text::caption(username));
 
-        let duration = widget::text::caption(track.duration_formatted());
+        let duration = widget::text::caption(duration_text);
 
         widget::button::custom(
             widget::row::with_capacity(4)
@@ -1087,7 +1203,7 @@ impl AppModel {
                 .spacing(space_s)
                 .align_y(Alignment::Center),
         )
-        .on_press(Message::PlayTrack(track.clone()))
+        .on_press(Message::PlayTrack(track_clone))
         .width(Length::Fill)
         .class(if is_playing {
             cosmic::theme::Button::Suggested
