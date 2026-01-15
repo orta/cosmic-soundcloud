@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=Cosmic Soundcloud
+Comment=Soundcloud for COSMIC folks
+Type=Application
+Icon=com.github.orta.cosmic-soundcloud
+Exec=cosmic-soundcloud %F
+Terminal=false
+StartupNotify=true
+Categories=COSMIC
+Keywords=COSMIC
+MimeType=
