@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use crate::api::{SoundCloudClient, Track, User};
+use crate::api::{Album, SoundCloudClient, Track, User};
 use crate::audio::{open_in_browser, AudioCommand, AudioEvent, AudioPlayer};
-use crate::config::Config;
+use crate::config::{Config, RecentArtist};
 use crate::fl;
+use crate::keyring;
 use cosmic::app::context_drawer;
 use cosmic::cosmic_config::{self, CosmicConfigEntry};
 use cosmic::iced::alignment::{Horizontal, Vertical};
@@ -76,6 +77,13 @@ impl LibraryTab {
     }
 }
 
+/// Navigation page
+#[derive(Debug, Clone, PartialEq)]
+pub enum Page {
+    Library,
+    Artist(u64),
+}
+
 /// Paginated data container
 #[derive(Debug, Clone)]
 pub struct PaginatedData<T> {
@@ -135,6 +143,12 @@ pub struct AppModel {
     // === Artwork Cache ===
     artwork_cache: HashMap<String, image::Handle>,
     artwork_loading: HashSet<String>,
+
+    // === Artist Page State ===
+    current_page: Page,
+    artist_user: Option<User>,
+    artist_albums: Vec<Album>,
+    artist_tracks: PaginatedData<Track>,
 }
 
 /// Messages emitted by the application and its widgets.
@@ -158,6 +172,7 @@ pub enum Message {
     LoadLikes,
     LoadMoreLikes,
     LikesLoaded(Result<(Vec<Track>, Option<String>), String>),
+    LikesScrolled(cosmic::iced_widget::scrollable::Viewport),
 
     // History
     LoadHistory,
@@ -180,6 +195,18 @@ pub enum Message {
     // Artwork
     LoadArtwork(String),
     ArtworkLoaded(String, Vec<u8>),
+
+    // Artist Navigation
+    NavigateToArtist(u64, String, Option<String>), // id, username, avatar_url
+    NavigateToLibrary,
+    ArtistLoaded(Result<User, String>),
+    ArtistAlbumsLoaded(Result<Vec<Album>, String>),
+    ArtistTracksLoaded(Result<(Vec<Track>, Option<String>), String>),
+    LoadMoreArtistTracks,
+
+    // Album Playback
+    PlayAlbum(u64),                              // album_id - load tracks and play
+    AlbumTracksLoaded(Result<Vec<Track>, String>),
 }
 
 /// Create a COSMIC application from the app model
@@ -234,15 +261,46 @@ impl cosmic::Application for AppModel {
 
         let volume = config.volume;
 
-        // Check if we have a saved token
-        let (auth_state, api_client) = if config.has_token() {
-            let token = config.oauth_token.clone().unwrap();
-            (
-                AuthState::Authenticating,
-                Some(SoundCloudClient::new(token)),
-            )
-        } else {
-            (AuthState::NotAuthenticated, None)
+        // Check if we have a saved token in keyring
+        // Also migrate any token from old config storage to keyring
+        let (auth_state, api_client) = {
+            // Try to get token from keyring first
+            eprintln!("[init] Checking keyring for existing token...");
+            let keyring_result = keyring::get_token();
+            eprintln!("[init] Keyring result: {keyring_result:?}");
+            let keyring_token = keyring_result.ok().flatten();
+
+            // Check if there's a token in config that should be migrated
+            let config_token = config.oauth_token.clone().filter(|t| !t.trim().is_empty());
+            eprintln!("[init] Config token present: {}", config_token.is_some());
+
+            // Use keyring token, or migrate config token to keyring
+            let token = if let Some(token) = keyring_token {
+                eprintln!("[init] Using token from keyring");
+                Some(token)
+            } else if let Some(token) = config_token {
+                // Migrate token from config to keyring
+                eprintln!("[init] Migrating token from config to keyring...");
+                match keyring::store_token(&token) {
+                    Ok(()) => eprintln!("[init] Migration successful"),
+                    Err(e) => eprintln!("[init] Migration failed: {e}"),
+                }
+                Some(token)
+            } else {
+                eprintln!("[init] No token found");
+                None
+            };
+
+            if let Some(token) = token {
+                eprintln!("[init] Token found, will authenticate (token length: {})", token.len());
+                (
+                    AuthState::Authenticating,
+                    Some(SoundCloudClient::new(token)),
+                )
+            } else {
+                eprintln!("[init] No token, showing login screen");
+                (AuthState::NotAuthenticated, None)
+            }
         };
 
         let mut app = AppModel {
@@ -268,7 +326,15 @@ impl cosmic::Application for AppModel {
             volume,
             artwork_cache: HashMap::new(),
             artwork_loading: HashSet::new(),
+            // Artist page state
+            current_page: Page::Library,
+            artist_user: None,
+            artist_albums: Vec::new(),
+            artist_tracks: PaginatedData::default(),
         };
+
+        // Rebuild nav to include recent artists from config
+        app.rebuild_nav();
 
         // If we have a token, fetch user info
         let command = if app.api_client.is_some() {
@@ -303,12 +369,27 @@ impl cosmic::Application for AppModel {
         let mut elements = Vec::new();
 
         if let Some(user) = &self.current_user {
-            let user_info = widget::row::with_capacity(2)
-                .push(
+            // Show user's avatar if loaded, otherwise default icon
+            let avatar: Element<_> = if let Some(avatar_url) = &user.avatar_url {
+                if let Some(handle) = self.artwork_cache.get(avatar_url) {
+                    widget::image(handle.clone())
+                        .width(Length::Fixed(24.0))
+                        .height(Length::Fixed(24.0))
+                        .content_fit(cosmic::iced::ContentFit::Cover)
+                        .into()
+                } else {
                     widget::icon::from_name("avatar-default-symbolic")
                         .size(24)
-                        .apply(Element::from),
-                )
+                        .apply(Element::from)
+                }
+            } else {
+                widget::icon::from_name("avatar-default-symbolic")
+                    .size(24)
+                    .apply(Element::from)
+            };
+
+            let user_info = widget::row::with_capacity(2)
+                .push(avatar)
                 .push(widget::text::body(&user.username))
                 .spacing(cosmic::theme::spacing().space_xs)
                 .align_y(Alignment::Center);
@@ -338,15 +419,13 @@ impl cosmic::Application for AppModel {
     }
 
     fn view(&self) -> Element<'_, Self::Message> {
-        let main_content = if !self.config.has_token() {
-            self.view_login()
-        } else {
-            match &self.auth_state {
-                AuthState::Authenticated => self.view_main_layout(),
-                AuthState::Authenticating => self.view_loading("Authenticating..."),
-                AuthState::Failed(err) => self.view_error(err),
-                AuthState::NotAuthenticated => self.view_login(),
-            }
+        // Use auth_state to decide what to show, not keyring
+        // Keyring is only for persistence across restarts
+        let main_content = match &self.auth_state {
+            AuthState::Authenticated => self.view_main_layout(),
+            AuthState::Authenticating => self.view_loading("Authenticating..."),
+            AuthState::Failed(err) => self.view_error(err),
+            AuthState::NotAuthenticated => self.view_login(),
         };
 
         widget::container(main_content)
@@ -362,22 +441,21 @@ impl cosmic::Application for AppModel {
                 .map(|update| Message::UpdateConfig(update.config)),
         ];
 
-        // Audio player subscription - spawn once and keep running
-        if self.audio_cmd_tx.is_none() {
-            subscriptions.push(Subscription::run(|| {
-                iced_futures::stream::channel(32, |mut emitter| async move {
-                    let (cmd_tx, mut evt_rx) = AudioPlayer::spawn();
+        // Audio player subscription - MUST be returned every time or iced will cancel it
+        // The subscription identity is tracked internally by iced, so it only spawns once
+        subscriptions.push(Subscription::run(|| {
+            iced_futures::stream::channel(32, |mut emitter| async move {
+                let (cmd_tx, mut evt_rx) = AudioPlayer::spawn();
 
-                    // Send the command channel back to the app
-                    let _ = emitter.send(Message::AudioReady(cmd_tx)).await;
+                // Send the command channel back to the app
+                let _ = emitter.send(Message::AudioReady(cmd_tx)).await;
 
-                    // Forward audio events
-                    while let Some(event) = evt_rx.recv().await {
-                        let _ = emitter.send(Message::AudioEvent(event)).await;
-                    }
-                })
-            }));
-        }
+                // Forward audio events forever
+                while let Some(event) = evt_rx.recv().await {
+                    let _ = emitter.send(Message::AudioEvent(event)).await;
+                }
+            })
+        }));
 
         Subscription::batch(subscriptions)
     }
@@ -410,27 +488,47 @@ impl cosmic::Application for AppModel {
 
             Message::SubmitToken => {
                 let token = self.login_token_input.trim().to_string();
+                eprintln!("[login] SubmitToken called, token length: {}", token.len());
                 if !token.is_empty() {
+                    eprintln!("[login] Token is not empty, proceeding with auth...");
                     self.auth_state = AuthState::Authenticating;
                     self.api_client = Some(SoundCloudClient::new(token.clone()));
 
-                    // Save token to config
+                    // Try to save to keyring (may not work on all systems)
+                    eprintln!("[login] Storing token in keyring...");
+                    match keyring::store_token(&token) {
+                        Ok(()) => eprintln!("[login] Token stored in keyring"),
+                        Err(e) => eprintln!("[login] Keyring unavailable: {e}"),
+                    }
+
+                    // Also save to config as fallback
                     self.config.oauth_token = Some(token);
                     if let Ok(config_context) =
                         cosmic_config::Config::new(Self::APP_ID, Config::VERSION)
                     {
                         let _ = self.config.write_entry(&config_context);
+                        eprintln!("[login] Token saved to config");
                     }
 
                     // Fetch user info
+                    eprintln!("[login] Fetching user info from API...");
                     let client = self.api_client.clone().unwrap();
                     return cosmic::task::future(async move {
+                        eprintln!("[login] Making API request to /me...");
                         match client.get_me().await {
-                            Ok(user) => Message::UserLoaded(Ok(user)),
-                            Err(e) => Message::UserLoaded(Err(e.to_string())),
+                            Ok(user) => {
+                                eprintln!("[login] API success: got user {}", user.username);
+                                Message::UserLoaded(Ok(user))
+                            }
+                            Err(e) => {
+                                eprintln!("[login] API error: {e}");
+                                Message::UserLoaded(Err(e.to_string()))
+                            }
                         }
                     })
                     .map(cosmic::Action::App);
+                } else {
+                    eprintln!("[login] Token is empty, ignoring submit");
                 }
             }
 
@@ -449,7 +547,10 @@ impl cosmic::Application for AppModel {
                 self.playback_status = PlaybackStatus::Stopped;
                 self.current_track = None;
 
-                // Clear saved token
+                // Delete token from keyring (if available)
+                let _ = keyring::delete_token();
+
+                // Clear token from config
                 self.config.oauth_token = None;
                 if let Ok(config_context) =
                     cosmic_config::Config::new(Self::APP_ID, Config::VERSION)
@@ -458,17 +559,34 @@ impl cosmic::Application for AppModel {
                 }
             }
 
-            Message::UserLoaded(result) => match result {
-                Ok(user) => {
-                    self.current_user = Some(user);
-                    self.auth_state = AuthState::Authenticated;
-                    return cosmic::task::message(cosmic::Action::App(Message::LoadLikes));
+            Message::UserLoaded(result) => {
+                eprintln!("[login] UserLoaded message received");
+                match result {
+                    Ok(user) => {
+                        eprintln!("[login] Authentication successful! User: {}", user.username);
+                        // Load user's avatar if available
+                        let mut tasks: Vec<Task<cosmic::Action<Message>>> =
+                            vec![cosmic::task::message(cosmic::Action::App(Message::LoadLikes))];
+                        if let Some(avatar_url) = &user.avatar_url {
+                            if !self.artwork_cache.contains_key(avatar_url)
+                                && !self.artwork_loading.contains(avatar_url)
+                            {
+                                tasks.push(cosmic::task::message(cosmic::Action::App(
+                                    Message::LoadArtwork(avatar_url.clone()),
+                                )));
+                            }
+                        }
+                        self.current_user = Some(user);
+                        self.auth_state = AuthState::Authenticated;
+                        return cosmic::task::batch(tasks);
+                    }
+                    Err(err) => {
+                        eprintln!("[login] Authentication failed: {err}");
+                        self.auth_state = AuthState::Failed(err);
+                        self.api_client = None;
+                    }
                 }
-                Err(err) => {
-                    self.auth_state = AuthState::Failed(err);
-                    self.api_client = None;
-                }
-            },
+            }
 
             // === Library Navigation ===
             Message::SwitchTab(entity) => {
@@ -550,6 +668,17 @@ impl cosmic::Application for AppModel {
                     Err(err) => {
                         eprintln!("Failed to load likes: {err}");
                     }
+                }
+            }
+
+            Message::LikesScrolled(viewport) => {
+                // Auto-load more when scrolled near bottom (80% threshold)
+                let scroll_percentage = viewport.relative_offset().y;
+                if scroll_percentage > 0.8
+                    && self.likes.next_href.is_some()
+                    && !self.likes.loading
+                {
+                    return cosmic::task::message(cosmic::Action::App(Message::LoadMoreLikes));
                 }
             }
 
@@ -684,6 +813,7 @@ impl cosmic::Application for AppModel {
                 }
                 AudioEvent::Finished => {
                     // Auto-play next track
+                    eprintln!("[auto-advance] AudioEvent::Finished received, dispatching NextTrack");
                     return cosmic::task::message(cosmic::Action::App(Message::NextTrack));
                 }
                 AudioEvent::Error(err) => {
@@ -733,19 +863,27 @@ impl cosmic::Application for AppModel {
             }
 
             Message::NextTrack => {
+                eprintln!("[auto-advance] NextTrack: playlist_len={}, playlist_index={}",
+                    self.current_playlist.len(), self.playlist_index);
                 if !self.current_playlist.is_empty() {
                     let next_index = (self.playlist_index + 1) % self.current_playlist.len();
+                    eprintln!("[auto-advance] NextTrack: next_index={}, repeat_mode={:?}",
+                        next_index, self.config.repeat_mode);
                     if next_index != 0 || self.config.repeat_mode == crate::config::RepeatMode::All
                     {
                         let track = self.current_playlist[next_index].clone();
+                        eprintln!("[auto-advance] NextTrack: playing '{}'", track.title);
                         let playlist = self.current_playlist.clone();
                         return cosmic::task::message(cosmic::Action::App(
                             Message::PlayTrackInPlaylist(track, playlist, next_index),
                         ));
                     } else {
                         // End of playlist
+                        eprintln!("[auto-advance] NextTrack: end of playlist, stopping");
                         self.playback_status = PlaybackStatus::Stopped;
                     }
+                } else {
+                    eprintln!("[auto-advance] NextTrack: playlist is empty!");
                 }
             }
 
@@ -802,12 +940,251 @@ impl cosmic::Application for AppModel {
                         .insert(url, image::Handle::from_bytes(data));
                 }
             }
+
+            // === Artist Navigation ===
+            Message::NavigateToArtist(user_id, username, avatar_url) => {
+                // Update recent artists list
+                let recent_artist = RecentArtist {
+                    id: user_id,
+                    username: username.clone(),
+                    avatar_url: avatar_url.clone(),
+                };
+
+                // Remove if already exists, then add to front
+                self.config
+                    .recent_artists
+                    .retain(|a| a.id != user_id);
+                self.config.recent_artists.insert(0, recent_artist);
+
+                // Keep only 10 most recent
+                self.config.recent_artists.truncate(10);
+
+                // Save to config
+                if let Ok(config_context) =
+                    cosmic_config::Config::new(Self::APP_ID, Config::VERSION)
+                {
+                    let _ = self.config.write_entry(&config_context);
+                }
+
+                // Switch to artist page
+                self.current_page = Page::Artist(user_id);
+                self.artist_user = None;
+                self.artist_albums = Vec::new();
+                self.artist_tracks = PaginatedData::default();
+
+                // Rebuild nav with recent artists
+                self.rebuild_nav();
+
+                // Fetch artist data
+                if let Some(client) = &self.api_client {
+                    let client = client.clone();
+                    return cosmic::task::future(async move {
+                        match client.get_user(user_id).await {
+                            Ok(user) => Message::ArtistLoaded(Ok(user)),
+                            Err(e) => Message::ArtistLoaded(Err(e.to_string())),
+                        }
+                    })
+                    .map(cosmic::Action::App);
+                }
+            }
+
+            Message::NavigateToLibrary => {
+                self.current_page = Page::Library;
+                self.rebuild_nav();
+            }
+
+            Message::ArtistLoaded(result) => match result {
+                Ok(user) => {
+                    let user_id = user.id;
+
+                    // Load avatar artwork if available
+                    let avatar_task = if let Some(avatar_url) = &user.avatar_url {
+                        if !self.artwork_cache.contains_key(avatar_url)
+                            && !self.artwork_loading.contains(avatar_url)
+                        {
+                            Some(cosmic::task::message(cosmic::Action::App(
+                                Message::LoadArtwork(avatar_url.clone()),
+                            )))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                    self.artist_user = Some(user);
+
+                    // Load albums and tracks in parallel
+                    if let Some(client) = &self.api_client {
+                        let client1 = client.clone();
+                        let client2 = client.clone();
+
+                        let albums_task = cosmic::task::future(async move {
+                            match client1.get_user_albums(user_id).await {
+                                Ok(albums) => Message::ArtistAlbumsLoaded(Ok(albums)),
+                                Err(e) => Message::ArtistAlbumsLoaded(Err(e.to_string())),
+                            }
+                        })
+                        .map(cosmic::Action::App);
+
+                        let tracks_task = cosmic::task::future(async move {
+                            match client2.get_user_tracks(user_id, None).await {
+                                Ok((tracks, next)) => Message::ArtistTracksLoaded(Ok((tracks, next))),
+                                Err(e) => Message::ArtistTracksLoaded(Err(e.to_string())),
+                            }
+                        })
+                        .map(cosmic::Action::App);
+
+                        let mut tasks = vec![albums_task, tracks_task];
+                        if let Some(avatar) = avatar_task {
+                            tasks.push(avatar);
+                        }
+                        return Task::batch(tasks);
+                    }
+                }
+                Err(err) => {
+                    eprintln!("Failed to load artist: {err}");
+                }
+            },
+
+            Message::ArtistAlbumsLoaded(result) => {
+                if let Ok(albums) = result {
+                    // Load album artwork
+                    let artwork_tasks: Vec<_> = albums
+                        .iter()
+                        .filter_map(|album| {
+                            album.artwork_url.as_ref().and_then(|url| {
+                                if !self.artwork_cache.contains_key(url)
+                                    && !self.artwork_loading.contains(url)
+                                {
+                                    Some(cosmic::task::message(cosmic::Action::App(
+                                        Message::LoadArtwork(url.clone()),
+                                    )))
+                                } else {
+                                    None
+                                }
+                            })
+                        })
+                        .collect();
+
+                    self.artist_albums = albums;
+
+                    if !artwork_tasks.is_empty() {
+                        return Task::batch(artwork_tasks);
+                    }
+                }
+            }
+
+            Message::ArtistTracksLoaded(result) => {
+                if let Ok((tracks, next_href)) = result {
+                    // Load track artwork
+                    let artwork_tasks: Vec<_> = tracks
+                        .iter()
+                        .filter_map(|track| {
+                            track.artwork_url.as_ref().and_then(|url| {
+                                if !self.artwork_cache.contains_key(url)
+                                    && !self.artwork_loading.contains(url)
+                                {
+                                    Some(cosmic::task::message(cosmic::Action::App(
+                                        Message::LoadArtwork(url.clone()),
+                                    )))
+                                } else {
+                                    None
+                                }
+                            })
+                        })
+                        .collect();
+
+                    self.artist_tracks.items.extend(tracks);
+                    self.artist_tracks.next_href = next_href;
+                    self.artist_tracks.loading = false;
+
+                    if !artwork_tasks.is_empty() {
+                        return Task::batch(artwork_tasks);
+                    }
+                }
+            }
+
+            Message::LoadMoreArtistTracks => {
+                if let (Some(client), Page::Artist(user_id), Some(next_href)) = (
+                    &self.api_client,
+                    &self.current_page,
+                    &self.artist_tracks.next_href,
+                ) {
+                    self.artist_tracks.loading = true;
+                    let client = client.clone();
+                    let next = next_href.clone();
+                    let user_id = *user_id;
+                    return cosmic::task::future(async move {
+                        match client.get_user_tracks(user_id, Some(&next)).await {
+                            Ok((tracks, next)) => Message::ArtistTracksLoaded(Ok((tracks, next))),
+                            Err(e) => Message::ArtistTracksLoaded(Err(e.to_string())),
+                        }
+                    })
+                    .map(cosmic::Action::App);
+                }
+            }
+
+            // === Album Playback ===
+            Message::PlayAlbum(album_id) => {
+                if let Some(client) = &self.api_client {
+                    let client = client.clone();
+                    return cosmic::task::future(async move {
+                        match client.get_playlist_tracks(album_id).await {
+                            Ok(tracks) => Message::AlbumTracksLoaded(Ok(tracks)),
+                            Err(e) => Message::AlbumTracksLoaded(Err(e.to_string())),
+                        }
+                    })
+                    .map(cosmic::Action::App);
+                }
+            }
+
+            Message::AlbumTracksLoaded(result) => {
+                if let Ok(tracks) = result {
+                    if !tracks.is_empty() {
+                        // Set as playlist and play first track
+                        let first_track = tracks[0].clone();
+                        let playlist = tracks;
+                        return cosmic::task::message(cosmic::Action::App(
+                            Message::PlayTrackInPlaylist(first_track, playlist, 0),
+                        ));
+                    }
+                } else if let Err(e) = result {
+                    eprintln!("Failed to load album tracks: {e}");
+                }
+            }
         }
         Task::none()
     }
 
     fn on_nav_select(&mut self, id: nav_bar::Id) -> Task<cosmic::Action<Self::Message>> {
         self.nav.activate(id);
+
+        // Handle page navigation based on nav data
+        if let Some(page) = self.nav.data::<Page>(id) {
+            match page {
+                Page::Library => {
+                    self.current_page = Page::Library;
+                }
+                Page::Artist(user_id) => {
+                    // Navigate to artist page - find the artist info from recent_artists
+                    if let Some(artist) = self
+                        .config
+                        .recent_artists
+                        .iter()
+                        .find(|a| a.id == *user_id)
+                    {
+                        let user_id = artist.id;
+                        let username = artist.username.clone();
+                        let avatar_url = artist.avatar_url.clone();
+                        return cosmic::task::message(cosmic::Action::App(
+                            Message::NavigateToArtist(user_id, username, avatar_url),
+                        ));
+                    }
+                }
+            }
+        }
+
         self.update_title()
     }
 }
@@ -828,11 +1205,79 @@ impl AppModel {
         }
     }
 
-    /// Main layout with library content and player bar at bottom
+    /// Rebuild the navigation model with Library and recent artists
+    fn rebuild_nav(&mut self) {
+        self.nav.clear();
+
+        // Clone data we need to avoid borrow issues
+        let recent_artists: Vec<_> = self
+            .config
+            .recent_artists
+            .iter()
+            .map(|a| (a.id, a.username.clone()))
+            .collect();
+        let current_page = self.current_page.clone();
+
+        // Add Library entry
+        let library_id = self
+            .nav
+            .insert()
+            .text(fl!("library"))
+            .icon(icon::from_name("folder-music-symbolic"))
+            .data::<Page>(Page::Library)
+            .id();
+
+        // Add recent artists section header and entries
+        let mut artist_nav_id = None;
+        if !recent_artists.is_empty() {
+            // Add "Recent Artists" section header (no icon, no page data = non-navigable)
+            let header_id = self
+                .nav
+                .insert()
+                .text(fl!("recent-artists"))
+                .id();
+            self.nav.divider_above_set(header_id, true);
+        }
+
+        for (artist_id, username) in recent_artists {
+            let nav_id = self
+                .nav
+                .insert()
+                .text(username)
+                .icon(icon::from_name("system-users-symbolic"))
+                .data::<Page>(Page::Artist(artist_id))
+                .id();
+
+            if let Page::Artist(current_id) = &current_page {
+                if *current_id == artist_id {
+                    artist_nav_id = Some(nav_id);
+                }
+            }
+        }
+
+        // Activate the appropriate nav item based on current page
+        match current_page {
+            Page::Library => {
+                self.nav.activate(library_id);
+            }
+            Page::Artist(_) => {
+                if let Some(nav_id) = artist_nav_id {
+                    self.nav.activate(nav_id);
+                }
+            }
+        }
+    }
+
+    /// Main layout with content based on current page and player bar at bottom
     fn view_main_layout(&self) -> Element<'_, Message> {
+        let content: Element<_> = match &self.current_page {
+            Page::Library => self.view_library(),
+            Page::Artist(_) => self.view_artist(),
+        };
+
         widget::column::with_capacity(2)
             .push(
-                widget::container(self.view_library())
+                widget::container(content)
                     .width(Length::Fill)
                     .height(Length::FillPortion(4)),
             )
@@ -931,7 +1376,7 @@ impl AppModel {
             .spacing(space_s)
             .align_y(Alignment::Center);
 
-        widget::container(
+        let player_bar = widget::container(
             widget::row::with_capacity(3)
                 .push(
                     widget::container(track_info)
@@ -953,8 +1398,12 @@ impl AppModel {
         )
         .class(cosmic::theme::Container::Card)
         .width(Length::Fill)
-        .height(Length::Fixed(100.0))
-        .into()
+        .height(Length::Fixed(100.0));
+
+        widget::container(player_bar)
+            .padding([0, 0, space_s / 2, 0])
+            .width(Length::Fill)
+            .into()
     }
 
     fn view_login(&self) -> Element<'_, Message> {
@@ -1020,13 +1469,208 @@ impl AppModel {
             .into()
     }
 
+    /// View for artist page showing artist info, albums, and tracks
+    fn view_artist(&self) -> Element<'_, Message> {
+        let space_s = cosmic::theme::spacing().space_s;
+        let space_m = cosmic::theme::spacing().space_m;
+        let space_l = cosmic::theme::spacing().space_l;
+
+        // Back button to library
+        let back_button = widget::button::icon(icon::from_name("go-previous-symbolic"))
+            .on_press(Message::NavigateToLibrary)
+            .class(cosmic::theme::Button::Text);
+
+        // Loading state
+        let Some(user) = &self.artist_user else {
+            return widget::column::with_capacity(2)
+                .push(back_button)
+                .push(self.view_loading("Loading artist..."))
+                .spacing(space_m)
+                .into();
+        };
+
+        // Header with artist info
+        let avatar: Element<_> = if let Some(avatar_url) = &user.avatar_url {
+            if let Some(handle) = self.artwork_cache.get(avatar_url) {
+                widget::image(handle.clone())
+                    .width(Length::Fixed(80.0))
+                    .height(Length::Fixed(80.0))
+                    .content_fit(cosmic::iced::ContentFit::Cover)
+                    .into()
+            } else {
+                widget::icon::from_name("avatar-default-symbolic")
+                    .size(80)
+                    .apply(Element::from)
+            }
+        } else {
+            widget::icon::from_name("avatar-default-symbolic")
+                .size(80)
+                .apply(Element::from)
+        };
+
+        let stats_text = format!(
+            "{} tracks · {} followers",
+            user.track_count, user.followers_count
+        );
+
+        let header = widget::row::with_capacity(3)
+            .push(back_button)
+            .push(avatar)
+            .push(
+                widget::column::with_capacity(2)
+                    .push(widget::text::title1(&user.username))
+                    .push(widget::text::body(stats_text))
+                    .spacing(space_s),
+            )
+            .spacing(space_m)
+            .align_y(Alignment::Center);
+
+        let mut content = widget::column::with_capacity(4)
+            .push(header)
+            .spacing(space_l)
+            .width(Length::Fill);
+
+        // Albums section (if any) - horizontally scrollable for artists with many albums
+        if !self.artist_albums.is_empty() {
+            let album_cards: Vec<Element<_>> = self
+                .artist_albums
+                .iter()
+                .map(|album| self.view_album_card(album))
+                .collect();
+
+            let albums_row = widget::row::with_children(album_cards).spacing(space_m);
+            let albums_scrollable = widget::scrollable::horizontal(albums_row);
+
+            let albums_section = widget::column::with_capacity(2)
+                .push(widget::text::title3("Albums"))
+                .push(albums_scrollable)
+                .spacing(space_s);
+
+            content = content.push(albums_section);
+        }
+
+        // Tracks section
+        let tracks_section = if self.artist_tracks.items.is_empty() && self.artist_tracks.loading {
+            widget::column::with_capacity(2)
+                .push(widget::text::title3("Tracks"))
+                .push(self.view_loading("Loading tracks..."))
+                .spacing(space_s)
+        } else if self.artist_tracks.items.is_empty() {
+            widget::column::with_capacity(2)
+                .push(widget::text::title3("Tracks"))
+                .push(widget::text::body("No tracks found."))
+                .spacing(space_s)
+        } else {
+            // Clone the full track list for playlist context
+            let playlist = self.artist_tracks.items.clone();
+            let track_items: Vec<Element<_>> = self
+                .artist_tracks
+                .items
+                .iter()
+                .enumerate()
+                .map(|(idx, track)| self.view_track_item_in_playlist(track, playlist.clone(), idx))
+                .collect();
+
+            let mut tracks = widget::column::with_children(track_items).spacing(space_s);
+
+            // Load more button
+            if self.artist_tracks.next_href.is_some() {
+                tracks = tracks.push(widget::vertical_space().height(Length::Fixed(8.0)));
+                tracks = tracks.push(
+                    widget::button::text(if self.artist_tracks.loading {
+                        "Loading..."
+                    } else {
+                        "Load More"
+                    })
+                    .on_press_maybe(if self.artist_tracks.loading {
+                        None
+                    } else {
+                        Some(Message::LoadMoreArtistTracks)
+                    }),
+                );
+            }
+
+            widget::column::with_capacity(2)
+                .push(widget::text::title3("Tracks"))
+                .push(tracks)
+                .spacing(space_s)
+        };
+
+        content = content.push(tracks_section);
+
+        // Add padding - right padding for scrollbar, bottom padding for player bar clearance
+        let padded_content = widget::container(content)
+            .padding([space_m as u16, space_m as u16, 120, space_m as u16]);
+
+        widget::scrollable(padded_content)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+
+    /// View for an album card - clicking plays the album
+    fn view_album_card(&self, album: &Album) -> Element<'_, Message> {
+        let space_s = cosmic::theme::spacing().space_s;
+        let album_id = album.id;
+
+        let artwork: Element<_> = if let Some(artwork_url) = &album.artwork_url {
+            if let Some(handle) = self.artwork_cache.get(artwork_url) {
+                widget::image(handle.clone())
+                    .width(Length::Fixed(80.0))
+                    .height(Length::Fixed(80.0))
+                    .content_fit(cosmic::iced::ContentFit::Cover)
+                    .into()
+            } else {
+                widget::icon::from_name("folder-music-symbolic")
+                    .size(80)
+                    .apply(Element::from)
+            }
+        } else {
+            widget::icon::from_name("folder-music-symbolic")
+                .size(80)
+                .apply(Element::from)
+        };
+
+        // Clone values to avoid lifetime issues
+        let title_text = album.title.clone();
+        let title = widget::text::body(title_text).width(Length::Fixed(80.0));
+
+        let release_info: Element<_> = if let Some(release_date) = &album.release_date {
+            // Extract year from date string (e.g., "2024-01-15" -> "2024")
+            let year = release_date
+                .split('-')
+                .next()
+                .unwrap_or(release_date)
+                .to_string();
+            widget::text::caption(year).into()
+        } else {
+            widget::text::caption(format!("{} tracks", album.track_count)).into()
+        };
+
+        let card_content = widget::column::with_capacity(3)
+            .push(artwork)
+            .push(title)
+            .push(release_info)
+            .spacing(space_s);
+
+        // Wrap in a button to make clickable
+        widget::button::custom(card_content)
+            .on_press(Message::PlayAlbum(album_id))
+            .class(cosmic::theme::Button::Text)
+            .padding(space_s)
+            .into()
+    }
+
     fn view_library(&self) -> Element<'_, Message> {
         let space_s = cosmic::theme::spacing().space_s;
         let space_m = cosmic::theme::spacing().space_m;
 
-        // Tab bar
-        let tabs =
-            widget::segmented_button::horizontal(&self.tab_model).on_activate(Message::SwitchTab);
+        // Tab bar (full width, evenly distributed, centered labels)
+        let tabs = widget::segmented_button::horizontal(&self.tab_model)
+            .on_activate(Message::SwitchTab)
+            .spacing(space_s)
+            .width(Length::Fill)
+            .button_alignment(Alignment::Center);
 
         // Tab content
         let tab_content = match self.current_tab {
@@ -1092,11 +1736,14 @@ impl AppModel {
             return widget::text::body("No liked tracks yet.").into();
         }
 
+        // Clone the full track list for playlist context
+        let playlist = self.likes.items.clone();
         let tracks: Vec<Element<_>> = self
             .likes
             .items
             .iter()
-            .map(|track| self.view_track_item(track))
+            .enumerate()
+            .map(|(idx, track)| self.view_track_item_in_playlist(track, playlist.clone(), idx))
             .collect();
 
         let mut content = widget::column::with_children(tracks).spacing(space_s);
@@ -1122,7 +1769,9 @@ impl AppModel {
         let padded_content = widget::container(content)
             .padding([0, space_m as u16, 120, 0]);
 
-        widget::scrollable(padded_content).into()
+        widget::scrollable(padded_content)
+            .on_scroll(Message::LikesScrolled)
+            .into()
     }
 
     fn view_history(&self) -> Element<'_, Message> {
@@ -1137,11 +1786,14 @@ impl AppModel {
             return widget::text::body("No listening history yet.").into();
         }
 
+        // Clone the full track list for playlist context
+        let playlist = self.history.items.clone();
         let tracks: Vec<Element<_>> = self
             .history
             .items
             .iter()
-            .map(|track| self.view_track_item(track))
+            .enumerate()
+            .map(|(idx, track)| self.view_track_item_in_playlist(track, playlist.clone(), idx))
             .collect();
 
         let content = widget::column::with_children(tracks).spacing(space_s);
@@ -1153,7 +1805,25 @@ impl AppModel {
         widget::scrollable(padded_content).into()
     }
 
+    /// Render a track item. If playlist_context is Some, clicking plays in playlist context.
+    fn view_track_item_in_playlist(
+        &self,
+        track: &Track,
+        playlist: Vec<Track>,
+        index: usize,
+    ) -> Element<'_, Message> {
+        self.view_track_item_inner(track, Some((playlist, index)))
+    }
+
     fn view_track_item(&self, track: &Track) -> Element<'_, Message> {
+        self.view_track_item_inner(track, None)
+    }
+
+    fn view_track_item_inner(
+        &self,
+        track: &Track,
+        playlist_context: Option<(Vec<Track>, usize)>,
+    ) -> Element<'_, Message> {
         let space_s = cosmic::theme::spacing().space_s;
 
         // Highlight currently playing track
@@ -1194,32 +1864,95 @@ impl AppModel {
         };
 
         let title = track.title.clone();
-        let username = track.user.username.clone();
         let duration_text = track.duration_formatted();
         let track_clone = track.clone();
 
+        // Make artist name clickable
+        let user_id = track.user.id;
+        let username = track.user.username.clone();
+        let avatar_url = track.user.avatar_url.clone();
+
+        // Use contrasting text colors when track is playing (accent background)
+        let (title_element, artist_element, duration_element): (Element<_>, Element<_>, Element<_>) =
+            if is_playing {
+                // Use on_accent color for text on accent background
+                let on_accent_style = cosmic::style::Text::Custom(|theme| {
+                    cosmic::iced_widget::text::Style {
+                        color: Some(theme.cosmic().on_accent_color().into()),
+                    }
+                });
+
+                let title_text = widget::text::body(title).class(on_accent_style.clone());
+                let artist_text =
+                    widget::text::caption(username.clone()).class(on_accent_style.clone());
+                let duration_text_widget =
+                    widget::text::caption(duration_text).class(on_accent_style);
+
+                // Wrap artist in a button that looks like text
+                let artist_btn = widget::button::custom(artist_text)
+                    .on_press(Message::NavigateToArtist(user_id, username, avatar_url))
+                    .class(cosmic::theme::Button::Text)
+                    .padding(0);
+
+                (title_text.into(), artist_btn.into(), duration_text_widget.into())
+            } else {
+                // Normal styling
+                let title_text = widget::text::body(title);
+                let artist_btn = widget::button::text(username.clone())
+                    .on_press(Message::NavigateToArtist(user_id, username, avatar_url))
+                    .class(cosmic::theme::Button::Link)
+                    .padding(0);
+                let duration_text_widget = widget::text::caption(duration_text);
+
+                (title_text.into(), artist_btn.into(), duration_text_widget.into())
+            };
+
         let info = widget::column::with_capacity(2)
-            .push(widget::text::body(title))
-            .push(widget::text::caption(username));
+            .push(title_element)
+            .push(artist_element);
 
-        let duration = widget::text::caption(duration_text);
+        let duration = duration_element;
 
-        widget::button::custom(
+        // Play button - if playlist context is provided, play in playlist mode
+        let play_message = if let Some((playlist, idx)) = playlist_context {
+            Message::PlayTrackInPlaylist(track_clone, playlist, idx)
+        } else {
+            Message::PlayTrack(track_clone)
+        };
+
+        let play_button = widget::button::custom(artwork)
+            .on_press(play_message)
+            .class(cosmic::theme::Button::Text)
+            .padding(0);
+
+        widget::container(
             widget::row::with_capacity(4)
-                .push(artwork)
+                .push(play_button)
                 .push(info)
                 .push(widget::horizontal_space())
                 .push(duration)
                 .spacing(space_s)
                 .align_y(Alignment::Center),
         )
-        .on_press(Message::PlayTrack(track_clone))
+        .class(cosmic::theme::Container::custom(move |theme| {
+            let cosmic = theme.cosmic();
+            cosmic::iced_widget::container::Style {
+                background: if is_playing {
+                    Some(cosmic::iced::Background::Color(
+                        cosmic.accent_color().into(),
+                    ))
+                } else {
+                    None
+                },
+                border: cosmic::iced::Border {
+                    radius: cosmic.corner_radii.radius_s.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        }))
+        .padding(space_s)
         .width(Length::Fill)
-        .class(if is_playing {
-            cosmic::theme::Button::Suggested
-        } else {
-            cosmic::theme::Button::Text
-        })
         .into()
     }
 
@@ -1236,11 +1969,6 @@ impl AppModel {
             .align_y(Vertical::Center)
             .into()
     }
-}
-
-/// The page to display in the application.
-pub enum Page {
-    Library,
 }
 
 /// The context page to display in the context drawer.

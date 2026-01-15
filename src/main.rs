@@ -5,6 +5,7 @@ mod app;
 mod audio;
 mod config;
 mod i18n;
+mod keyring;
 
 fn main() -> cosmic::iced::Result {
     // Get the system's preferred languages.

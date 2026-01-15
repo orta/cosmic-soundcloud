@@ -3,7 +3,7 @@
 use reqwest::Client;
 use std::fmt;
 
-use super::types::{LikesResponse, StreamUrlResponse, Track, TracksResponse, User};
+use super::types::{Album, AlbumsResponse, LikesResponse, StreamUrlResponse, Track, TracksResponse, User};
 
 const SOUNDCLOUD_API_V2: &str = "https://api-v2.soundcloud.com";
 const DEFAULT_CLIENT_ID: &str = "FPh1fGfGpygQyivIKoNCi4d6d490BOvt";
@@ -146,6 +146,120 @@ impl SoundCloudClient {
 
         let history: TracksResponse = response.json().await?;
         Ok((history.collection, history.next_href))
+    }
+
+    /// Get any user's profile by ID
+    pub async fn get_user(&self, user_id: u64) -> Result<User, ApiError> {
+        let url = self.url_with_client_id(&format!("/users/{user_id}"));
+        let response = self
+            .http
+            .get(&url)
+            .header("Authorization", self.auth_header())
+            .send()
+            .await?;
+
+        if response.status() == 401 {
+            return Err(ApiError::Unauthorized);
+        }
+        if response.status() == 404 {
+            return Err(ApiError::NotFound);
+        }
+
+        Ok(response.json().await?)
+    }
+
+    /// Get a user's albums
+    pub async fn get_user_albums(&self, user_id: u64) -> Result<Vec<Album>, ApiError> {
+        let url = self.url_with_client_id(&format!(
+            "/users/{user_id}/albums?limit=50&linked_partitioning=1"
+        ));
+
+        let response = self
+            .http
+            .get(&url)
+            .header("Authorization", self.auth_header())
+            .send()
+            .await?;
+
+        if response.status() == 401 {
+            return Err(ApiError::Unauthorized);
+        }
+
+        let albums: AlbumsResponse = response.json().await?;
+        Ok(albums.collection)
+    }
+
+    /// Get a user's uploaded tracks
+    pub async fn get_user_tracks(
+        &self,
+        user_id: u64,
+        next_href: Option<&str>,
+    ) -> Result<(Vec<Track>, Option<String>), ApiError> {
+        let url = match next_href {
+            Some(href) => href.to_string(),
+            None => self.url_with_client_id(&format!(
+                "/users/{user_id}/tracks?limit=24&linked_partitioning=1"
+            )),
+        };
+
+        let response = self
+            .http
+            .get(&url)
+            .header("Authorization", self.auth_header())
+            .send()
+            .await?;
+
+        if response.status() == 401 {
+            return Err(ApiError::Unauthorized);
+        }
+
+        let tracks: TracksResponse = response.json().await?;
+        Ok((tracks.collection, tracks.next_href))
+    }
+
+    /// Get tracks from a playlist/album
+    pub async fn get_playlist_tracks(&self, playlist_id: u64) -> Result<Vec<Track>, ApiError> {
+        let url = self.url_with_client_id(&format!("/playlists/{playlist_id}"));
+        eprintln!("[api] Fetching playlist tracks from: {url}");
+
+        let response = self
+            .http
+            .get(&url)
+            .header("Authorization", self.auth_header())
+            .send()
+            .await?;
+
+        if response.status() == 401 {
+            return Err(ApiError::Unauthorized);
+        }
+        if response.status() == 404 {
+            return Err(ApiError::NotFound);
+        }
+
+        // Get raw text to debug
+        let text = response.text().await?;
+        eprintln!("[api] Playlist response (first 500 chars): {}", &text[..text.len().min(500)]);
+
+        let playlist: super::types::PlaylistWithTracks = serde_json::from_str(&text)
+            .map_err(|e| {
+                eprintln!("[api] JSON parse error: {e}");
+                ApiError::Json(e.to_string())
+            })?;
+
+        // Filter out stub tracks (those missing title/user data)
+        let complete_tracks: Vec<Track> = playlist
+            .tracks
+            .into_iter()
+            .filter(|t| t.is_complete())
+            .collect();
+
+        eprintln!(
+            "[api] Playlist has {} complete tracks (out of {} total)",
+            complete_tracks.len(),
+            playlist.track_count
+        );
+
+        Ok(complete_tracks)
     }
 
     /// Get the actual stream URL for a track

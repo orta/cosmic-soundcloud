@@ -3,6 +3,7 @@ about = About
 repository = Repository
 view = View
 library = Library
+recent-artists = Recent Artists
 welcome = Welcome to COSMIC!
 page-id = Page { $num }
 git-description = Git commit {$hash} on {$date}

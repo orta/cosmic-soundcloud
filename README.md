@@ -1,6 +1,19 @@
 # Cosmic Soundcloud
 
-Soundcloud for COSMIC folks
+A native SoundCloud client for the COSMIC desktop environment.
+
+## Features
+
+- Browse your SoundCloud library with your liked tracks and listening history
+- Play tracks with a built-in audio player (with playlist support and auto-advancement)
+- View artist pages with their albums and tracks
+- Quick access to recently visited artists in the sidebar
+
+![Library Overview](images/library.png)
+
+![Liked Tracks](images/likes.png)
+
+![Artist Page](images/artist.png)
 
 ## Installation
 

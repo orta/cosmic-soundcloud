@@ -32,6 +32,9 @@ m3u8-rs = "6"
 # Utilities
 parking_lot = "0.12"
 
+# Secure credential storage
+keyring = "3"
+
 [dependencies.libcosmic]
 git = "https://github.com/pop-os/libcosmic.git"
 # See https://github.com/pop-os/libcosmic/blob/master/Cargo.toml for available features.

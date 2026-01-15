@@ -12,10 +12,20 @@ pub enum RepeatMode {
     All,
 }
 
+/// A recently viewed artist for quick navigation
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecentArtist {
+    pub id: u64,
+    pub username: String,
+    pub avatar_url: Option<String>,
+}
+
 #[derive(Debug, Clone, CosmicConfigEntry, PartialEq)]
 #[version = 2]
 pub struct Config {
     /// OAuth token for SoundCloud API authentication
+    /// DEPRECATED: Token is now stored in system keyring for security.
+    /// This field is kept for migration from older versions.
     pub oauth_token: Option<String>,
     /// Volume level (0.0 - 1.0)
     pub volume: f32,
@@ -23,6 +33,8 @@ pub struct Config {
     pub shuffle: bool,
     /// Repeat mode
     pub repeat_mode: RepeatMode,
+    /// Recently viewed artists (max 10)
+    pub recent_artists: Vec<RecentArtist>,
 }
 
 impl Default for Config {
@@ -32,15 +44,8 @@ impl Default for Config {
             volume: 0.8,
             shuffle: false,
             repeat_mode: RepeatMode::None,
+            recent_artists: Vec::new(),
         }
     }
 }
 
-impl Config {
-    /// Check if we have a valid OAuth token
-    pub fn has_token(&self) -> bool {
-        self.oauth_token
-            .as_ref()
-            .map_or(false, |t| !t.trim().is_empty())
-    }
-}

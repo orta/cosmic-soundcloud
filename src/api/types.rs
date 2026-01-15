@@ -20,9 +20,11 @@ pub struct User {
 }
 
 /// Simplified user info embedded in tracks
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct TrackUser {
+    #[serde(default)]
     pub id: u64,
+    #[serde(default)]
     pub username: String,
     pub avatar_url: Option<String>,
 }
@@ -50,10 +52,15 @@ pub struct Media {
 }
 
 /// SoundCloud track
+/// Note: Playlists may return "stub" tracks with only id - use is_complete() to check
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Track {
     pub id: u64,
+    /// Title may be missing for stub tracks in playlists
+    #[serde(default)]
     pub title: String,
+    /// User may be missing for stub tracks
+    #[serde(default)]
     pub user: TrackUser,
     pub artwork_url: Option<String>,
     /// Duration in milliseconds
@@ -83,6 +90,12 @@ impl Track {
         let mins = total_secs / 60;
         let secs = total_secs % 60;
         format!("{mins}:{secs:02}")
+    }
+
+    /// Check if this is a complete track (not a stub from playlist response)
+    /// Stub tracks only have id and need to be fetched separately
+    pub fn is_complete(&self) -> bool {
+        !self.title.is_empty() && !self.user.username.is_empty()
     }
 
     /// Find progressive (direct) stream transcoding, preferring MP3 over MP4
@@ -175,6 +188,38 @@ pub struct Playlist {
     pub track_count: u32,
     pub user: TrackUser,
     pub permalink_url: Option<String>,
+}
+
+/// Playlist/album response with embedded tracks
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PlaylistWithTracks {
+    pub id: u64,
+    pub title: String,
+    pub artwork_url: Option<String>,
+    #[serde(default)]
+    pub track_count: u32,
+    #[serde(default)]
+    pub tracks: Vec<Track>,
+}
+
+/// SoundCloud album (a type of playlist)
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Album {
+    pub id: u64,
+    pub title: String,
+    pub artwork_url: Option<String>,
+    #[serde(default)]
+    pub track_count: u32,
+    pub release_date: Option<String>,
+    pub user: TrackUser,
+    pub permalink_url: Option<String>,
+}
+
+/// Paginated response for albums
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AlbumsResponse {
+    pub collection: Vec<Album>,
+    pub next_href: Option<String>,
 }
 
 /// Stream URL response
