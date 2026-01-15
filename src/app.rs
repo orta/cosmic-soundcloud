@@ -1082,6 +1082,7 @@ impl AppModel {
 
     fn view_likes(&self) -> Element<'_, Message> {
         let space_s = cosmic::theme::spacing().space_s;
+        let space_m = cosmic::theme::spacing().space_m;
 
         if self.likes.loading && self.likes.items.is_empty() {
             return self.view_loading("Loading likes...");
@@ -1117,11 +1118,16 @@ impl AppModel {
             );
         }
 
-        widget::scrollable(content).into()
+        // Add bottom padding for player bar clearance and right padding for scrollbar
+        let padded_content = widget::container(content)
+            .padding([0, space_m as u16, 120, 0]);
+
+        widget::scrollable(padded_content).into()
     }
 
     fn view_history(&self) -> Element<'_, Message> {
         let space_s = cosmic::theme::spacing().space_s;
+        let space_m = cosmic::theme::spacing().space_m;
 
         if self.history.loading && self.history.items.is_empty() {
             return self.view_loading("Loading history...");
@@ -1140,7 +1146,11 @@ impl AppModel {
 
         let content = widget::column::with_children(tracks).spacing(space_s);
 
-        widget::scrollable(content).into()
+        // Add bottom padding for player bar clearance and right padding for scrollbar
+        let padded_content = widget::container(content)
+            .padding([0, space_m as u16, 120, 0]);
+
+        widget::scrollable(padded_content).into()
     }
 
     fn view_track_item(&self, track: &Track) -> Element<'_, Message> {
