@@ -74,7 +74,6 @@ The project uses GitHub Actions for automated releases. Three workflows handle C
 
 On every push and PR to `main`/`dev`, the [CI workflow](.github/workflows/ci.yml) runs:
 
-- Code formatting check (`cargo fmt`)
 - Linting (`cargo clippy`)
 - Build verification
 - Tests
