@@ -111,6 +111,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: write
     steps:
       - uses: actions/checkout@v4
 
@@ -162,3 +163,8 @@ jobs:
           files: |
             artifacts/*.deb
             artifacts/*.flatpak
+
+      - name: Trigger Flatpak Repository deployment
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run flatpak-repo.yml --ref main

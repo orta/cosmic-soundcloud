@@ -112,7 +112,7 @@ The [release workflow](.github/workflows/release.yml) will automatically:
 The [flatpak-repo workflow](.github/workflows/flatpak-repo.yml) publishes the Flatpak to GitHub Pages on each release, creating a Flatpak repository users can add:
 
 ```bash
-flatpak remote-add --if-not-exists cosmic-soundcloud https://orta.github.io/cosmic-soundcloud
+flatpak remote-add --if-not-exists --no-gpg-verify cosmic-soundcloud https://orta.github.io/cosmic-soundcloud
 flatpak install cosmic-soundcloud com.github.orta.cosmic-soundcloud
 ```
 

@@ -1402,11 +1402,11 @@ impl AppModel {
         let space_l = cosmic::theme::spacing().space_l;
 
         let content = widget::column::with_capacity(5)
-            .push(widget::text::title1("Welcome to Cosmic SoundCloud"))
+            .push(widget::text::title1("Welcome to COSMIC SoundCloud"))
             .push(widget::vertical_space().height(Length::Fixed(space_l as f32)))
             .push(widget::text::body(
                 "Enter your SoundCloud OAuth token to get started.\n\
-                 You can find this in your browser cookies after logging into SoundCloud.",
+                 You can find this in your browser cookies after logging into SoundCloud. You need to look through networking requests to find 'authorization' headers.",
             ))
             .push(widget::vertical_space().height(Length::Fixed(space_m as f32)))
             .push(
