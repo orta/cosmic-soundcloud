@@ -30,11 +30,19 @@ jobs:
           tar pcf vendor.tar vendor
           rm -rf vendor
 
+      - name: Import GPG key
+        id: gpg
+        uses: crazy-max/ghaction-import-gpg@v6
+        with:
+          gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
+          passphrase: ${{ secrets.GPG_PASSPHRASE }}
+
       - name: Build
         uses: andyholmes/flatter@main
         with:
           files: com.github.orta.cosmic-soundcloud.json
           arch: x86_64
+          gpg-sign: ${{ steps.gpg.outputs.fingerprint }}
           upload-bundles: true
           upload-pages-artifact: true
           flatpakrepo-name: cosmic-soundcloud
