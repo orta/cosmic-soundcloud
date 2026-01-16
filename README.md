@@ -15,6 +15,15 @@ A native SoundCloud client for the COSMIC desktop environment.
 
 ![Artist Page](images/artist.png)
 
+### Install via Flatpak
+
+```bash
+flatpak remote-add --if-not-exists --no-gpg-verify cosmic-soundcloud https://orta.github.io/cosmic-soundcloud
+flatpak install cosmic-soundcloud com.github.orta.cosmic-soundcloud
+```
+
+Or grab a `.deb` from the [Releases](https://github.com/orta/cosmic-soundcloud/releases).
+
 ## Installation
 
 A [justfile](./justfile) is included by default for the [casey/just][just] command runner.
@@ -106,15 +115,6 @@ The [release workflow](.github/workflows/release.yml) will automatically:
 - Build a `.flatpak` bundle
 - Create a GitHub Release with both artifacts
 - Extract release notes from the metainfo file
-
-### Flatpak Repository
-
-The [flatpak-repo workflow](.github/workflows/flatpak-repo.yml) publishes the Flatpak to GitHub Pages on each release, creating a Flatpak repository users can add:
-
-```bash
-flatpak remote-add --if-not-exists --no-gpg-verify cosmic-soundcloud https://orta.github.io/cosmic-soundcloud
-flatpak install cosmic-soundcloud com.github.orta.cosmic-soundcloud
-```
 
 Note: You'll need to enable GitHub Pages in your repository settings (Settings → Pages → Source: GitHub Actions).
 
