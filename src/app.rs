@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use crate::api::{Album, SoundCloudClient, Track, User};
+use crate::api::{Album, Playlist, SoundCloudClient, Track, User};
 use crate::audio::{open_in_browser, AudioCommand, AudioEvent, AudioPlayer};
 use crate::config::{Config, RecentArtist};
 use crate::fl;
@@ -82,6 +82,8 @@ impl LibraryTab {
 pub enum Page {
     Library,
     Artist(u64),
+    Search,
+    Recommendations,
 }
 
 /// Paginated data container
@@ -149,6 +151,14 @@ pub struct AppModel {
     artist_user: Option<User>,
     artist_albums: Vec<Album>,
     artist_tracks: PaginatedData<Track>,
+
+    // === Search Page State ===
+    search_query: String,
+    search_results: PaginatedData<User>,
+
+    // === Recommendations Page State ===
+    recommendations: Vec<Playlist>,
+    recommendations_loading: bool,
 }
 
 /// Messages emitted by the application and its widgets.
@@ -206,6 +216,19 @@ pub enum Message {
     // Album Playback
     PlayAlbum(u64),                              // album_id - load tracks and play
     AlbumTracksLoaded(Result<Vec<Track>, String>),
+
+    // Search
+    SearchQueryInput(String),
+    SubmitSearch,
+    SearchResultsLoaded(Result<(Vec<User>, Option<String>), String>),
+    LoadMoreSearchResults,
+    NavigateToSearch,
+
+    // Recommendations
+    NavigateToRecommendations,
+    LoadRecommendations,
+    RecommendationsLoaded(Result<Vec<Playlist>, String>),
+    PlayPlaylist(u64),
 }
 
 /// Create a COSMIC application from the app model
@@ -330,6 +353,12 @@ impl cosmic::Application for AppModel {
             artist_user: None,
             artist_albums: Vec::new(),
             artist_tracks: PaginatedData::default(),
+            // Search page state
+            search_query: String::new(),
+            search_results: PaginatedData::default(),
+            // Recommendations page state
+            recommendations: Vec::new(),
+            recommendations_loading: false,
         };
 
         // Rebuild nav to include recent artists from config
@@ -1144,6 +1173,152 @@ impl cosmic::Application for AppModel {
                     eprintln!("Failed to load album tracks: {e}");
                 }
             }
+
+            // === Search ===
+            Message::NavigateToSearch => {
+                self.current_page = Page::Search;
+                self.rebuild_nav();
+            }
+
+            Message::SearchQueryInput(query) => {
+                self.search_query = query;
+            }
+
+            Message::SubmitSearch => {
+                let query = self.search_query.trim().to_string();
+                if !query.is_empty() {
+                    self.search_results = PaginatedData::default();
+                    self.search_results.loading = true;
+
+                    if let Some(client) = &self.api_client {
+                        let client = client.clone();
+                        return cosmic::task::future(async move {
+                            match client.search_users(&query, None).await {
+                                Ok((users, next)) => Message::SearchResultsLoaded(Ok((users, next))),
+                                Err(e) => Message::SearchResultsLoaded(Err(e.to_string())),
+                            }
+                        })
+                        .map(cosmic::Action::App);
+                    }
+                }
+            }
+
+            Message::SearchResultsLoaded(result) => {
+                self.search_results.loading = false;
+                match result {
+                    Ok((users, next_href)) => {
+                        // Queue artwork loading for new users
+                        let artwork_urls: Vec<_> = users
+                            .iter()
+                            .filter_map(|u| u.avatar_url.clone())
+                            .filter(|url| {
+                                !self.artwork_cache.contains_key(url)
+                                    && !self.artwork_loading.contains(url)
+                            })
+                            .collect();
+
+                        self.search_results.items.extend(users);
+                        self.search_results.next_href = next_href;
+
+                        if !artwork_urls.is_empty() {
+                            let tasks: Vec<Task<cosmic::Action<Message>>> = artwork_urls
+                                .into_iter()
+                                .map(|url| {
+                                    cosmic::task::message(cosmic::Action::App(Message::LoadArtwork(
+                                        url,
+                                    )))
+                                })
+                                .collect();
+                            return cosmic::task::batch(tasks);
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!("Failed to search users: {err}");
+                    }
+                }
+            }
+
+            Message::LoadMoreSearchResults => {
+                if let (Some(client), Some(next_href)) =
+                    (&self.api_client, &self.search_results.next_href)
+                {
+                    self.search_results.loading = true;
+                    let client = client.clone();
+                    let next = next_href.clone();
+                    let query = self.search_query.clone();
+                    return cosmic::task::future(async move {
+                        match client.search_users(&query, Some(&next)).await {
+                            Ok((users, next)) => Message::SearchResultsLoaded(Ok((users, next))),
+                            Err(e) => Message::SearchResultsLoaded(Err(e.to_string())),
+                        }
+                    })
+                    .map(cosmic::Action::App);
+                }
+            }
+
+            // === Recommendations ===
+            Message::NavigateToRecommendations => {
+                self.current_page = Page::Recommendations;
+                self.rebuild_nav();
+
+                // Load recommendations if not already loaded
+                if self.recommendations.is_empty() && !self.recommendations_loading {
+                    return cosmic::task::message(cosmic::Action::App(Message::LoadRecommendations));
+                }
+            }
+
+            Message::LoadRecommendations => {
+                if let Some(client) = &self.api_client {
+                    self.recommendations_loading = true;
+                    let client = client.clone();
+                    return cosmic::task::future(async move {
+                        match client.get_recommendations().await {
+                            Ok(playlists) => Message::RecommendationsLoaded(Ok(playlists)),
+                            Err(e) => Message::RecommendationsLoaded(Err(e.to_string())),
+                        }
+                    })
+                    .map(cosmic::Action::App);
+                }
+            }
+
+            Message::RecommendationsLoaded(result) => {
+                self.recommendations_loading = false;
+                match result {
+                    Ok(playlists) => {
+                        // Queue artwork loading for playlists
+                        let artwork_urls: Vec<_> = playlists
+                            .iter()
+                            .filter_map(|p| p.artwork_url.clone())
+                            .filter(|url| {
+                                !self.artwork_cache.contains_key(url)
+                                    && !self.artwork_loading.contains(url)
+                            })
+                            .collect();
+
+                        self.recommendations = playlists;
+
+                        if !artwork_urls.is_empty() {
+                            let tasks: Vec<Task<cosmic::Action<Message>>> = artwork_urls
+                                .into_iter()
+                                .map(|url| {
+                                    cosmic::task::message(cosmic::Action::App(Message::LoadArtwork(
+                                        url,
+                                    )))
+                                })
+                                .collect();
+                            return cosmic::task::batch(tasks);
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!("Failed to load recommendations: {err}");
+                    }
+                }
+            }
+
+            Message::PlayPlaylist(playlist_id) => {
+                // Reuse the album/playlist loading logic
+                return cosmic::task::message(cosmic::Action::App(Message::PlayAlbum(playlist_id)));
+            }
         }
         Task::none()
     }
@@ -1173,6 +1348,14 @@ impl cosmic::Application for AppModel {
                         ));
                     }
                 }
+                Page::Search => {
+                    return cosmic::task::message(cosmic::Action::App(Message::NavigateToSearch));
+                }
+                Page::Recommendations => {
+                    return cosmic::task::message(cosmic::Action::App(
+                        Message::NavigateToRecommendations,
+                    ));
+                }
             }
         }
 
@@ -1196,7 +1379,7 @@ impl AppModel {
         }
     }
 
-    /// Rebuild the navigation model with Library and recent artists
+    /// Rebuild the navigation model with Library, Search, Recommendations, and recent artists
     fn rebuild_nav(&mut self) {
         self.nav.clear();
 
@@ -1216,6 +1399,24 @@ impl AppModel {
             .text(fl!("library"))
             .icon(icon::from_name("folder-music-symbolic"))
             .data::<Page>(Page::Library)
+            .id();
+
+        // Add Search entry
+        let search_id = self
+            .nav
+            .insert()
+            .text(fl!("search"))
+            .icon(icon::from_name("system-search-symbolic"))
+            .data::<Page>(Page::Search)
+            .id();
+
+        // Add Recommendations entry
+        let recommendations_id = self
+            .nav
+            .insert()
+            .text(fl!("recommendations"))
+            .icon(icon::from_name("starred-symbolic"))
+            .data::<Page>(Page::Recommendations)
             .id();
 
         // Add recent artists section header and entries
@@ -1256,6 +1457,12 @@ impl AppModel {
                     self.nav.activate(nav_id);
                 }
             }
+            Page::Search => {
+                self.nav.activate(search_id);
+            }
+            Page::Recommendations => {
+                self.nav.activate(recommendations_id);
+            }
         }
     }
 
@@ -1264,6 +1471,8 @@ impl AppModel {
         let content: Element<_> = match &self.current_page {
             Page::Library => self.view_library(),
             Page::Artist(_) => self.view_artist(),
+            Page::Search => self.view_search(),
+            Page::Recommendations => self.view_recommendations(),
         };
 
         widget::column::with_capacity(2)
@@ -1954,6 +2163,223 @@ impl AppModel {
             .height(Length::Fill)
             .align_x(Horizontal::Center)
             .align_y(Vertical::Center)
+            .into()
+    }
+
+    /// View for the search page
+    fn view_search(&self) -> Element<'_, Message> {
+        let space_s = cosmic::theme::spacing().space_s;
+        let space_m = cosmic::theme::spacing().space_m;
+
+        // Search input
+        let search_input = widget::text_input(fl!("search-artists"), &self.search_query)
+            .on_input(Message::SearchQueryInput)
+            .on_submit(|_| Message::SubmitSearch)
+            .width(Length::Fill);
+
+        let search_button = widget::button::suggested(fl!("search"))
+            .on_press(Message::SubmitSearch);
+
+        let search_bar = widget::row::with_capacity(2)
+            .push(search_input)
+            .push(search_button)
+            .spacing(space_s)
+            .align_y(Alignment::Center);
+
+        // Results
+        let results_content: Element<_> = if self.search_results.loading
+            && self.search_results.items.is_empty()
+        {
+            self.view_loading("Loading...")
+        } else if self.search_results.items.is_empty() && !self.search_query.is_empty() {
+            widget::text::body(fl!("no-results")).into()
+        } else if self.search_results.items.is_empty() {
+            widget::text::body("Enter a search term to find artists.").into()
+        } else {
+            let user_items: Vec<Element<_>> = self
+                .search_results
+                .items
+                .iter()
+                .map(|user| self.view_user_search_result(user))
+                .collect();
+
+            let mut results = widget::column::with_children(user_items).spacing(space_s);
+
+            // Load more button
+            if self.search_results.next_href.is_some() {
+                results = results.push(widget::vertical_space().height(Length::Fixed(8.0)));
+                results = results.push(
+                    widget::button::text(if self.search_results.loading {
+                        "Loading..."
+                    } else {
+                        "Load More"
+                    })
+                    .on_press_maybe(if self.search_results.loading {
+                        None
+                    } else {
+                        Some(Message::LoadMoreSearchResults)
+                    }),
+                );
+            }
+
+            // Add bottom padding for player bar clearance
+            let padded_results =
+                widget::container(results).padding([0, space_m as u16, 120, 0]);
+
+            widget::scrollable(padded_results)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        };
+
+        widget::column::with_capacity(2)
+            .push(search_bar)
+            .push(results_content)
+            .spacing(space_m)
+            .padding(space_m)
+            .into()
+    }
+
+    /// View for a user search result item
+    fn view_user_search_result(&self, user: &User) -> Element<'_, Message> {
+        let space_s = cosmic::theme::spacing().space_s;
+
+        let avatar: Element<_> = if let Some(avatar_url) = &user.avatar_url {
+            if let Some(handle) = self.artwork_cache.get(avatar_url) {
+                widget::image(handle.clone())
+                    .width(Length::Fixed(48.0))
+                    .height(Length::Fixed(48.0))
+                    .content_fit(cosmic::iced::ContentFit::Cover)
+                    .into()
+            } else {
+                widget::icon::from_name("avatar-default-symbolic")
+                    .size(48)
+                    .apply(Element::from)
+            }
+        } else {
+            widget::icon::from_name("avatar-default-symbolic")
+                .size(48)
+                .apply(Element::from)
+        };
+
+        let stats_text = format!(
+            "{} tracks · {} followers",
+            user.track_count, user.followers_count
+        );
+
+        // Clone user data to avoid lifetime issues
+        let username_display = user.username.clone();
+        let user_id = user.id;
+        let username = user.username.clone();
+        let avatar_url = user.avatar_url.clone();
+
+        let info = widget::column::with_capacity(2)
+            .push(widget::text::body(username_display))
+            .push(widget::text::caption(stats_text));
+
+        widget::button::custom(
+            widget::row::with_capacity(2)
+                .push(avatar)
+                .push(info)
+                .spacing(space_s)
+                .align_y(Alignment::Center)
+                .width(Length::Fill),
+        )
+        .on_press(Message::NavigateToArtist(user_id, username, avatar_url))
+        .class(cosmic::theme::Button::Text)
+        .padding(space_s)
+        .width(Length::Fill)
+        .into()
+    }
+
+    /// View for the recommendations page
+    fn view_recommendations(&self) -> Element<'_, Message> {
+        let space_m = cosmic::theme::spacing().space_m;
+
+        let header = widget::text::title2(fl!("recommendations"));
+
+        let content: Element<_> = if self.recommendations_loading && self.recommendations.is_empty()
+        {
+            self.view_loading("Loading...")
+        } else if self.recommendations.is_empty() {
+            widget::text::body("No recommendations available.").into()
+        } else {
+            // Grid of playlist cards - build rows of 4
+            let mut rows: Vec<Element<_>> = Vec::new();
+            let playlists: Vec<_> = self.recommendations.iter().collect();
+
+            for chunk in playlists.chunks(4) {
+                let mut row = widget::row::with_capacity(4).spacing(space_m);
+                for playlist in chunk {
+                    row = row.push(self.view_playlist_card(playlist));
+                }
+                // Fill remaining space if less than 4 items
+                for _ in chunk.len()..4 {
+                    row = row.push(widget::horizontal_space());
+                }
+                rows.push(row.into());
+            }
+
+            let grid = widget::column::with_children(rows).spacing(space_m);
+
+            // Add bottom padding for player bar clearance
+            let padded_grid = widget::container(grid).padding([0, space_m as u16, 120, 0]);
+
+            widget::scrollable(padded_grid)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        };
+
+        widget::column::with_capacity(2)
+            .push(header)
+            .push(content)
+            .spacing(space_m)
+            .padding(space_m)
+            .into()
+    }
+
+    /// View for a playlist card
+    fn view_playlist_card(&self, playlist: &Playlist) -> Element<'_, Message> {
+        let space_s = cosmic::theme::spacing().space_s;
+        let playlist_id = playlist.id;
+
+        let artwork: Element<_> = if let Some(artwork_url) = &playlist.artwork_url {
+            if let Some(handle) = self.artwork_cache.get(artwork_url) {
+                widget::image(handle.clone())
+                    .width(Length::Fixed(120.0))
+                    .height(Length::Fixed(120.0))
+                    .content_fit(cosmic::iced::ContentFit::Cover)
+                    .into()
+            } else {
+                widget::icon::from_name("folder-music-symbolic")
+                    .size(120)
+                    .apply(Element::from)
+            }
+        } else {
+            widget::icon::from_name("folder-music-symbolic")
+                .size(120)
+                .apply(Element::from)
+        };
+
+        // Clone data to avoid lifetime issues
+        let title_text = playlist.title.clone();
+        let track_count = playlist.track_count;
+
+        let title = widget::text::body(title_text).width(Length::Fixed(120.0));
+        let subtitle = widget::text::caption(format!("{track_count} tracks"));
+
+        let card_content = widget::column::with_capacity(3)
+            .push(artwork)
+            .push(title)
+            .push(subtitle)
+            .spacing(space_s)
+            .width(Length::Fixed(120.0));
+
+        widget::button::custom(card_content)
+            .on_press(Message::PlayPlaylist(playlist_id))
+            .class(cosmic::theme::Button::Text)
+            .padding(space_s)
             .into()
     }
 }

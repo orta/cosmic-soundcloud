@@ -1157,6 +1157,7 @@ dependencies = [
  "serde_json",
  "stream-download",
  "tokio",
+ "urlencoding",
 ]
 
 [[package]]

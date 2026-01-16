@@ -4,4 +4,4 @@ mod client;
 mod types;
 
 pub use client::SoundCloudClient;
-pub use types::{Album, Track, User};
+pub use types::{Album, Playlist, Track, User};

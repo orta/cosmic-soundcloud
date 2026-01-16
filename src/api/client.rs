@@ -3,7 +3,7 @@
 use reqwest::Client;
 use std::fmt;
 
-use super::types::{Album, AlbumsResponse, LikesResponse, StreamUrlResponse, Track, TracksResponse, User};
+use super::types::{Album, AlbumsResponse, LikesResponse, Playlist, StreamUrlResponse, Track, TracksResponse, User, UsersSearchResponse};
 
 const SOUNDCLOUD_API_V2: &str = "https://api-v2.soundcloud.com";
 const DEFAULT_CLIENT_ID: &str = "FPh1fGfGpygQyivIKoNCi4d6d490BOvt";
@@ -260,6 +260,101 @@ impl SoundCloudClient {
         );
 
         Ok(complete_tracks)
+    }
+
+    /// Search for users/artists
+    pub async fn search_users(
+        &self,
+        query: &str,
+        next_href: Option<&str>,
+    ) -> Result<(Vec<User>, Option<String>), ApiError> {
+        let url = match next_href {
+            Some(href) => href.to_string(),
+            None => {
+                let encoded_query = urlencoding::encode(query);
+                self.url_with_client_id(&format!(
+                    "/search/users?q={encoded_query}&limit=24&linked_partitioning=1"
+                ))
+            }
+        };
+
+        let response = self
+            .http
+            .get(&url)
+            .header("Authorization", self.auth_header())
+            .send()
+            .await?;
+
+        if response.status() == 401 {
+            return Err(ApiError::Unauthorized);
+        }
+
+        let results: UsersSearchResponse = response.json().await?;
+        Ok((results.collection, results.next_href))
+    }
+
+    /// Get recommended/featured playlists (uses the mixed selections endpoint)
+    pub async fn get_recommendations(&self) -> Result<Vec<Playlist>, ApiError> {
+        // Use the discover/sets endpoint which returns curated playlists
+        let url = self.url_with_client_id("/mixed-selections?limit=10");
+
+        let response = self
+            .http
+            .get(&url)
+            .header("Authorization", self.auth_header())
+            .send()
+            .await?;
+
+        if response.status() == 401 {
+            return Err(ApiError::Unauthorized);
+        }
+
+        // The mixed-selections endpoint returns a different structure
+        // with "collection" containing selection items that have playlists
+        let text = response.text().await?;
+
+        // Parse the mixed selections response
+        #[derive(serde::Deserialize)]
+        struct MixedSelectionsResponse {
+            collection: Vec<MixedSelection>,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct MixedSelection {
+            items: Option<MixedItems>,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct MixedItems {
+            collection: Vec<MixedItem>,
+        }
+
+        #[derive(serde::Deserialize)]
+        #[serde(tag = "kind")]
+        enum MixedItem {
+            #[serde(rename = "playlist")]
+            Playlist(Playlist),
+            #[serde(other)]
+            Other,
+        }
+
+        let selections: MixedSelectionsResponse = serde_json::from_str(&text)
+            .map_err(|e| ApiError::Json(e.to_string()))?;
+
+        // Extract playlists from selections
+        let playlists: Vec<Playlist> = selections
+            .collection
+            .into_iter()
+            .filter_map(|s| s.items)
+            .flat_map(|items| items.collection)
+            .filter_map(|item| match item {
+                MixedItem::Playlist(p) => Some(p),
+                MixedItem::Other => None,
+            })
+            .take(20)
+            .collect();
+
+        Ok(playlists)
     }
 
     /// Get the actual stream URL for a track

@@ -34,6 +34,7 @@ parking_lot = "0.12"
 
 # Secure credential storage
 keyring = "3"
+urlencoding = "2.1.3"
 
 [dependencies.libcosmic]
 git = "https://github.com/pop-os/libcosmic.git"

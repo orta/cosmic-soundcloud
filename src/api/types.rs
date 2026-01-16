@@ -203,3 +203,31 @@ pub struct AlbumsResponse {
 pub struct StreamUrlResponse {
     pub url: String,
 }
+
+/// SoundCloud playlist (for recommendations, user playlists, etc.)
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Playlist {
+    pub id: u64,
+    pub title: String,
+    pub artwork_url: Option<String>,
+    #[serde(default)]
+    pub track_count: u32,
+    #[serde(default)]
+    pub likes_count: u64,
+    pub user: TrackUser,
+    pub permalink_url: Option<String>,
+}
+
+/// Paginated response for playlists
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PlaylistsResponse {
+    pub collection: Vec<Playlist>,
+    pub next_href: Option<String>,
+}
+
+/// Search results for users
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct UsersSearchResponse {
+    pub collection: Vec<User>,
+    pub next_href: Option<String>,
+}
