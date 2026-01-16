@@ -10,11 +10,3 @@
 pub fn open_in_browser(track_url: &str) -> Result<(), String> {
     open::that(track_url).map_err(|e| format!("Failed to open browser: {e}"))
 }
-
-/// Check if the system likely has a browser that supports DRM
-/// (Chrome, Edge, Firefox typically do on Linux with proper CDM setup)
-pub fn check_drm_browser_support() -> bool {
-    // Most modern browsers support DRM, so we optimistically return true
-    // The actual DRM playback success depends on browser configuration
-    true
-}

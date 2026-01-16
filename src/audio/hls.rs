@@ -7,6 +7,7 @@ use reqwest::Client;
 
 /// HLS stream information
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct HlsStream {
     pub segments: Vec<HlsSegment>,
     pub target_duration: u64,
@@ -17,6 +18,7 @@ pub struct HlsStream {
 
 /// A single HLS segment
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct HlsSegment {
     pub uri: String,
     pub duration: f32,
@@ -25,6 +27,7 @@ pub struct HlsSegment {
 
 /// HLS encryption information
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct HlsEncryption {
     pub method: String,
     pub uri: Option<String>,
@@ -87,20 +90,20 @@ fn parse_media_playlist(playlist: &MediaPlaylist, base_url: &str) -> HlsStream {
 
     // Parse segments
     let segments = playlist.segments.iter()
-        .filter_map(|seg| {
+        .map(|seg| {
             let uri = if seg.uri.starts_with("http") {
                 seg.uri.clone()
             } else {
                 format!("{}/{}", base, seg.uri)
             };
 
-            Some(HlsSegment {
+            HlsSegment {
                 uri,
                 duration: seg.duration,
                 byte_range: seg.byte_range.as_ref().map(|br| {
                     (br.length, br.offset.unwrap_or(0))
                 }),
-            })
+            }
         })
         .collect();
 

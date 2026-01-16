@@ -71,8 +71,3 @@ pub fn delete_token() -> Result<(), keyring::Error> {
         Err(e) => Err(e),
     }
 }
-
-/// Check if a token exists in the keyring
-pub fn has_token() -> bool {
-    get_token().map(|t| t.is_some()).unwrap_or(false)
-}

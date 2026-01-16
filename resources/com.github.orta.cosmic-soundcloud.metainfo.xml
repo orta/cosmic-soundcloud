@@ -5,10 +5,13 @@
   <project_license>MPL-2.0</project_license>
   <name>Cosmic Soundcloud</name>
   <summary>Soundcloud for COSMIC folks</summary>
+  <description>
+    <p>A SoundCloud client for the COSMIC desktop environment. Not perfect, or feature complete, but a reasonable start</p>
+  </description>
   <icon type="remote" width="64" height="64" scale="1">
-    https://github.com/pop-os/cosmic-app-template/raw/main/resources/icons/hicolor/scalable/apps/icon.svg
+    https://github.com/orta/cosmic-soundcloud/raw/main/resources/icons/hicolor/scalable/apps/com.github.orta.cosmic-soundcloud.svg
   </icon>
-  <url type="vcs-browser">https://github.com/pop-os/cosmic-app-template</url>
+  <url type="vcs-browser">https://github.com/orta/cosmic-soundcloud</url>
   <launchable type="desktop-id">com.github.orta.cosmic-soundcloud.desktop</launchable>
   <provides>
     <id>com.github.orta.cosmic-soundcloud</id>

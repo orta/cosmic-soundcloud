@@ -133,14 +133,13 @@ impl AudioPlayer {
                         }
                         _ = check_interval.tick() => {
                             // Check if playback finished
-                            if was_playing {
-                                if let Some(sink) = &player.sink {
-                                    if sink.empty() {
-                                        eprintln!("Track finished playing");
-                                        was_playing = false;
-                                        let _ = player.event_tx.send(AudioEvent::Finished).await;
-                                    }
-                                }
+                            if was_playing
+                                && let Some(sink) = &player.sink
+                                && sink.empty()
+                            {
+                                eprintln!("Track finished playing");
+                                was_playing = false;
+                                let _ = player.event_tx.send(AudioEvent::Finished).await;
                             }
                         }
                     }
@@ -292,7 +291,7 @@ impl AudioPlayer {
 
             // Check for commercial DRM that requires a license server
             // SAMPLE-AES alone just means encryption - it's the keyformat that determines DRM
-            let is_commercial_drm = enc.keyformat.as_ref().map_or(false, |k| {
+            let is_commercial_drm = enc.keyformat.as_ref().is_some_and(|k| {
                 k.contains("playready")     // Microsoft PlayReady
                 || k.contains("widevine")   // Google Widevine
                 || k.contains("fairplay")   // Apple FairPlay
@@ -317,18 +316,18 @@ impl AudioPlayer {
                 eprintln!("Encrypted stream detected ({}), trying yt-dlp fallback...", drm_type);
 
                 // Try yt-dlp to get an unencrypted stream
-                if let Some(track_url) = permalink_url {
-                    if !track_url.is_empty() {
-                        match ytdlp::extract_stream_url(track_url) {
-                            Ok(ytdlp_url) => {
-                                eprintln!("yt-dlp extracted URL: {}...", &ytdlp_url[..ytdlp_url.len().min(80)]);
-                                // Play the yt-dlp URL using play_hls_stream directly to avoid recursion
-                                self.play_hls_stream(&ytdlp_url).await;
-                                return;
-                            }
-                            Err(e) => {
-                                eprintln!("yt-dlp failed: {e}");
-                            }
+                if let Some(track_url) = permalink_url
+                    && !track_url.is_empty()
+                {
+                    match ytdlp::extract_stream_url(track_url) {
+                        Ok(ytdlp_url) => {
+                            eprintln!("yt-dlp extracted URL: {}...", &ytdlp_url[..ytdlp_url.len().min(80)]);
+                            // Play the yt-dlp URL using play_hls_stream directly to avoid recursion
+                            self.play_hls_stream(&ytdlp_url).await;
+                            return;
+                        }
+                        Err(e) => {
+                            eprintln!("yt-dlp failed: {e}");
                         }
                     }
                 }

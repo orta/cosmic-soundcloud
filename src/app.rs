@@ -187,7 +187,6 @@ pub enum Message {
     AudioEvent(AudioEvent),
     StreamUrlLoaded(Result<String, String>),
     TogglePlayPause,
-    StopPlayback,
     NextTrack,
     PreviousTrack,
     SetVolume(f32),
@@ -567,14 +566,13 @@ impl cosmic::Application for AppModel {
                         // Load user's avatar if available
                         let mut tasks: Vec<Task<cosmic::Action<Message>>> =
                             vec![cosmic::task::message(cosmic::Action::App(Message::LoadLikes))];
-                        if let Some(avatar_url) = &user.avatar_url {
-                            if !self.artwork_cache.contains_key(avatar_url)
-                                && !self.artwork_loading.contains(avatar_url)
-                            {
-                                tasks.push(cosmic::task::message(cosmic::Action::App(
-                                    Message::LoadArtwork(avatar_url.clone()),
-                                )));
-                            }
+                        if let Some(avatar_url) = &user.avatar_url
+                            && !self.artwork_cache.contains_key(avatar_url)
+                            && !self.artwork_loading.contains(avatar_url)
+                        {
+                            tasks.push(cosmic::task::message(cosmic::Action::App(
+                                Message::LoadArtwork(avatar_url.clone()),
+                            )));
                         }
                         self.current_user = Some(user);
                         self.auth_state = AuthState::Authenticated;
@@ -749,10 +747,11 @@ impl cosmic::Application for AppModel {
 
                 // Load artwork if not cached
                 let mut tasks = Vec::new();
-                if let Some(artwork_url) = &track.artwork_url {
-                    if !self.artwork_cache.contains_key(artwork_url) && !self.artwork_loading.contains(artwork_url) {
-                        tasks.push(cosmic::task::message(cosmic::Action::App(Message::LoadArtwork(artwork_url.clone()))));
-                    }
+                if let Some(artwork_url) = &track.artwork_url
+                    && !self.artwork_cache.contains_key(artwork_url)
+                    && !self.artwork_loading.contains(artwork_url)
+                {
+                    tasks.push(cosmic::task::message(cosmic::Action::App(Message::LoadArtwork(artwork_url.clone()))));
                 }
 
                 // Fetch stream URL and play
@@ -823,10 +822,10 @@ impl cosmic::Application for AppModel {
                 AudioEvent::DrmProtected { drm_type, track_url } => {
                     eprintln!("DRM-protected content ({drm_type}) - opening in browser");
                     self.playback_status = PlaybackStatus::Stopped;
-                    if !track_url.is_empty() {
-                        if let Err(e) = open_in_browser(&track_url) {
-                            eprintln!("Failed to open browser: {e}");
-                        }
+                    if !track_url.is_empty()
+                        && let Err(e) = open_in_browser(&track_url)
+                    {
+                        eprintln!("Failed to open browser: {e}");
                     }
                 }
                 AudioEvent::Ready => {}
@@ -852,14 +851,6 @@ impl cosmic::Application for AppModel {
                         PlaybackStatus::Buffering => {}
                     }
                 }
-            }
-
-            Message::StopPlayback => {
-                if let Some(tx) = &self.audio_cmd_tx {
-                    let _ = tx.blocking_send(AudioCommand::Stop);
-                }
-                self.playback_status = PlaybackStatus::Stopped;
-                self.current_track = None;
             }
 
             Message::NextTrack => {
@@ -1248,10 +1239,10 @@ impl AppModel {
                 .data::<Page>(Page::Artist(artist_id))
                 .id();
 
-            if let Page::Artist(current_id) = &current_page {
-                if *current_id == artist_id {
-                    artist_nav_id = Some(nav_id);
-                }
+            if let Page::Artist(current_id) = &current_page
+                && *current_id == artist_id
+            {
+                artist_nav_id = Some(nav_id);
             }
         }
 
@@ -1815,10 +1806,6 @@ impl AppModel {
         self.view_track_item_inner(track, Some((playlist, index)))
     }
 
-    fn view_track_item(&self, track: &Track) -> Element<'_, Message> {
-        self.view_track_item_inner(track, None)
-    }
-
     fn view_track_item_inner(
         &self,
         track: &Track,
@@ -1830,7 +1817,7 @@ impl AppModel {
         let is_playing = self
             .current_track
             .as_ref()
-            .map_or(false, |t| t.id == track.id);
+            .is_some_and(|t| t.id == track.id);
 
         // Get artwork element
         let artwork: Element<_> = if let Some(artwork_url) = &track.artwork_url {
@@ -1882,9 +1869,9 @@ impl AppModel {
                     }
                 });
 
-                let title_text = widget::text::body(title).class(on_accent_style.clone());
+                let title_text = widget::text::body(title).class(on_accent_style);
                 let artist_text =
-                    widget::text::caption(username.clone()).class(on_accent_style.clone());
+                    widget::text::caption(username.clone()).class(on_accent_style);
                 let duration_text_widget =
                     widget::text::caption(duration_text).class(on_accent_style);
 

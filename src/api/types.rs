@@ -77,13 +77,6 @@ pub struct Track {
 }
 
 impl Track {
-    /// Get a higher resolution artwork URL by replacing size suffix
-    pub fn artwork_url_large(&self) -> Option<String> {
-        self.artwork_url
-            .as_ref()
-            .map(|url| url.replace("-large.", "-t500x500."))
-    }
-
     /// Format duration as MM:SS
     pub fn duration_formatted(&self) -> String {
         let total_secs = self.duration / 1000;
@@ -150,11 +143,6 @@ impl Track {
         // Fall back to encrypted HLS (requires yt-dlp fallback)
         self.encrypted_hls_transcoding()
     }
-
-    /// Check if this track has playable audio
-    pub fn is_playable(&self) -> bool {
-        self.best_transcoding().is_some()
-    }
 }
 
 /// A liked track item from the API
@@ -176,18 +164,6 @@ pub struct LikesResponse {
 pub struct TracksResponse {
     pub collection: Vec<Track>,
     pub next_href: Option<String>,
-}
-
-/// SoundCloud playlist
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct Playlist {
-    pub id: u64,
-    pub title: String,
-    pub artwork_url: Option<String>,
-    #[serde(default)]
-    pub track_count: u32,
-    pub user: TrackUser,
-    pub permalink_url: Option<String>,
 }
 
 /// Playlist/album response with embedded tracks

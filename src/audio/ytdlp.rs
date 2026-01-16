@@ -35,12 +35,3 @@ pub fn extract_stream_url(track_url: &str) -> Result<String, String> {
 
     Ok(url)
 }
-
-/// Check if yt-dlp is available on the system
-pub fn is_available() -> bool {
-    Command::new("yt-dlp")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
