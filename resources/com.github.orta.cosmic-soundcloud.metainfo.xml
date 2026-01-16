@@ -35,6 +35,11 @@
   </keywords>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="0.2.1" date="2026-01-16">
+      <description>
+        <p>Work on getting flatpak to work</p>
+      </description>
+    </release>
     <release version="0.2.0" date="2026-01-16">
       <description>
         <p>Adds the likes, and the artist pages</p>
