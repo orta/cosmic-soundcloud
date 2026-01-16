@@ -31,5 +31,12 @@
     <keyword>COSMIC</keyword>
   </keywords>
   <content_rating type="oars-1.1" />
+  <releases>
+    <release version="0.2.0" date="2026-01-16">
+      <description>
+        <p>Adds the likes, and the artist pages</p>
+      </description>
+    </release>
+  </releases>
 </component>
 
