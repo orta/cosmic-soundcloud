@@ -81,17 +81,25 @@ On every push and PR to `main`/`dev`, the [CI workflow](.github/workflows/ci.yml
 
 ### Creating a Release
 
-To create a new release:
+Use the release script to create a new release:
 
-1. Update the version in `Cargo.toml`
-2. Add release notes to the metainfo file (`resources/com.github.orta.cosmic-soundcloud.metainfo.xml`)
-3. Commit and push
-4. Create and push a version tag:
+```bash
+./scripts/release.sh
+```
 
-   ```bash
-   git tag v0.1.0
-   git push origin v0.1.0
-   ```
+The script will:
+
+1. Ask you for the new version number
+2. Ask you for release notes (one item per line)
+3. Update `Cargo.toml` with the new version
+4. Add release notes to the metainfo file
+5. Create a commit and tag
+
+After the script completes, push the changes:
+
+```bash
+git push && git push origin v<version>
+```
 
 The [release workflow](.github/workflows/release.yml) will automatically:
 
