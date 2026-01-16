@@ -37,6 +37,10 @@ jobs:
           arch: x86_64
           upload-bundles: true
           upload-pages-artifact: true
+          flatpakrepo-name: cosmic-soundcloud
+          flatpakrepo-title: COSMIC SoundCloud
+          flatpakrepo-url: https://orta.io/cosmic-soundcloud
+          flatpakrepo-description: SoundCloud client for COSMIC desktop
 
   deploy:
     name: Deploy to GitHub Pages

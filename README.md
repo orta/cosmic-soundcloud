@@ -18,7 +18,7 @@ A native SoundCloud client for the COSMIC desktop environment.
 ### Install via Flatpak
 
 ```bash
-flatpak remote-add --if-not-exists --no-gpg-verify cosmic-soundcloud https://orta.github.io/cosmic-soundcloud
+flatpak remote-add --if-not-exists cosmic-soundcloud https://orta.io/cosmic-soundcloud/index.flatpakrepo
 flatpak install cosmic-soundcloud com.github.orta.cosmic-soundcloud
 ```
 
