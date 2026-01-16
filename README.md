@@ -102,14 +102,9 @@ The script will:
 3. Update `Cargo.toml` with the new version
 4. Add release notes to the metainfo file
 5. Create a commit and tag
+6. Push to origin
 
-After the script completes, push the changes:
-
-```bash
-git push && git push origin v<version>
-```
-
-The [release workflow](.github/workflows/release.yml) will automatically:
+The [release workflow](.github/workflows/release.yml) will then automatically:
 
 - Build a `.deb` package for Debian/Ubuntu
 - Build a `.flatpak` bundle
