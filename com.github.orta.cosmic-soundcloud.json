@@ -1,0 +1,47 @@
+{
+    "id": "com.github.orta.cosmic-soundcloud",
+    "runtime": "org.freedesktop.Platform",
+    "runtime-version": "24.08",
+    "sdk": "org.freedesktop.Sdk",
+    "sdk-extensions": [
+        "org.freedesktop.Sdk.Extension.rust-stable"
+    ],
+    "command": "cosmic-soundcloud",
+    "finish-args": [
+        "--share=ipc",
+        "--socket=fallback-x11",
+        "--socket=wayland",
+        "--socket=pulseaudio",
+        "--device=dri",
+        "--share=network",
+        "--filesystem=xdg-config/cosmic:ro",
+        "--talk-name=org.freedesktop.secrets"
+    ],
+    "build-options": {
+        "append-path": "/usr/lib/sdk/rust-stable/bin",
+        "env": {
+            "CARGO_HOME": "/run/build/cosmic-soundcloud/cargo",
+            "RUST_BACKTRACE": "1"
+        }
+    },
+    "modules": [
+        {
+            "name": "cosmic-soundcloud",
+            "buildsystem": "simple",
+            "build-commands": [
+                "tar xf vendor.tar",
+                "cargo --offline build --release --frozen",
+                "install -Dm755 target/release/cosmic-soundcloud /app/bin/cosmic-soundcloud",
+                "install -Dm644 resources/com.github.orta.cosmic-soundcloud.desktop /app/share/applications/com.github.orta.cosmic-soundcloud.desktop",
+                "install -Dm644 resources/com.github.orta.cosmic-soundcloud.metainfo.xml /app/share/metainfo/com.github.orta.cosmic-soundcloud.metainfo.xml",
+                "install -Dm644 resources/icons/hicolor/scalable/apps/com.github.orta.cosmic-soundcloud.svg /app/share/icons/hicolor/scalable/apps/com.github.orta.cosmic-soundcloud.svg"
+            ],
+            "sources": [
+                {
+                    "type": "dir",
+                    "path": "."
+                }
+            ]
+        }
+    ]
+}

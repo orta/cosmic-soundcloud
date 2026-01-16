@@ -1,0 +1,164 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-deb:
+    name: Build Debian Package
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dpkg-dev libssl-dev pkg-config libxkbcommon-dev libasound2-dev
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Get version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Create .deb package
+        run: |
+          PKG_NAME="cosmic-soundcloud"
+          PKG_VERSION="${{ steps.version.outputs.VERSION }}"
+          PKG_DIR="${PKG_NAME}_${PKG_VERSION}_amd64"
+
+          mkdir -p "${PKG_DIR}/DEBIAN"
+          mkdir -p "${PKG_DIR}/usr/bin"
+          mkdir -p "${PKG_DIR}/usr/share/applications"
+          mkdir -p "${PKG_DIR}/usr/share/metainfo"
+          mkdir -p "${PKG_DIR}/usr/share/icons/hicolor/scalable/apps"
+
+          # Copy files
+          cp target/release/cosmic-soundcloud "${PKG_DIR}/usr/bin/"
+          cp resources/com.github.orta.cosmic-soundcloud.desktop "${PKG_DIR}/usr/share/applications/"
+          cp resources/com.github.orta.cosmic-soundcloud.metainfo.xml "${PKG_DIR}/usr/share/metainfo/"
+          cp resources/icons/hicolor/scalable/apps/com.github.orta.cosmic-soundcloud.svg "${PKG_DIR}/usr/share/icons/hicolor/scalable/apps/"
+
+          # Create control file
+          cat > "${PKG_DIR}/DEBIAN/control" << EOF
+          Package: cosmic-soundcloud
+          Version: ${PKG_VERSION}
+          Section: sound
+          Priority: optional
+          Architecture: amd64
+          Depends: libasound2
+          Recommends: yt-dlp
+          Maintainer: Orta Therox <orta.therox@gmail.com>
+          Description: SoundCloud client for COSMIC desktop
+           A native SoundCloud client for the COSMIC desktop environment.
+           .
+           Features include browsing your likes, playing tracks with HLS streaming,
+           artist pages, listening history, and more.
+          EOF
+
+          # Build the package
+          dpkg-deb --build "${PKG_DIR}"
+
+          mkdir -p output
+          mv "${PKG_DIR}.deb" output/
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: debian-package-amd64
+          path: output/*.deb
+
+  build-flatpak:
+    name: Build Flatpak
+    runs-on: ubuntu-24.04
+    container:
+      image: bilelmoussaoui/flatpak-github-actions:freedesktop-24.08
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust for vendoring
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Vendor dependencies
+        run: |
+          mkdir -p .cargo
+          cargo vendor | head -n -1 > .cargo/config.toml
+          echo 'directory = "vendor"' >> .cargo/config.toml
+          tar pcf vendor.tar vendor
+          rm -rf vendor
+
+      - name: Build Flatpak
+        uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          bundle: cosmic-soundcloud-x86_64.flatpak
+          manifest-path: com.github.orta.cosmic-soundcloud.json
+          arch: x86_64
+          cache-key: flatpak-builder-x86_64-${{ github.sha }}
+
+  release:
+    name: Create Release
+    needs: [build-deb, build-flatpak]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+          merge-multiple: true
+
+      - name: List artifacts
+        run: find artifacts/ -type f
+
+      - name: Get version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Install xmllint
+        run: sudo apt-get update && sudo apt-get install -y libxml2-utils
+
+      - name: Extract release notes from metainfo
+        id: release_notes
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          # Extract the description content for this version from metainfo XML
+          # Uses xmllint to get the release node, then formats the HTML content
+          NOTES=$(xmllint --xpath "//release[@version='${VERSION}']/description/*" resources/com.github.orta.cosmic-soundcloud.metainfo.xml 2>/dev/null | \
+            sed 's/<p>/\n/g; s/<\/p>//g; s/<ul>/\n/g; s/<\/ul>//g; s/<li>/- /g; s/<\/li>//g' | \
+            sed '/^$/d' | \
+            sed 's/^[[:space:]]*//')
+
+          if [ -z "$NOTES" ]; then
+            NOTES="Release ${VERSION}"
+          fi
+
+          # Use heredoc for multiline output
+          {
+            echo "NOTES<<EOF"
+            echo "$NOTES"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: Release ${{ steps.version.outputs.VERSION }}
+          body: ${{ steps.release_notes.outputs.NOTES }}
+          draft: false
+          prerelease: ${{ contains(github.ref, 'alpha') || contains(github.ref, 'beta') || contains(github.ref, 'rc') }}
+          files: |
+            artifacts/*.deb
+            artifacts/*.flatpak

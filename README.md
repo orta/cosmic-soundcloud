@@ -66,6 +66,51 @@ The app uses a background audio player thread that receives commands via async c
 
 Developers should install [rustup][rustup] and configure their editor to use [rust-analyzer][rust-analyzer]. To improve compilation times, disable LTO in the release profile, install the [mold][mold] linker, and configure [sccache][sccache] for use with Rust. The [mold][mold] linker will only improve link times if LTO is disabled.
 
+## Releasing
+
+The project uses GitHub Actions for automated releases. Three workflows handle CI and deployment:
+
+### Continuous Integration
+
+On every push and PR to `main`/`dev`, the [CI workflow](.github/workflows/ci.yml) runs:
+
+- Code formatting check (`cargo fmt`)
+- Linting (`cargo clippy`)
+- Build verification
+- Tests
+
+### Creating a Release
+
+To create a new release:
+
+1. Update the version in `Cargo.toml`
+2. Add release notes to the metainfo file (`resources/com.github.orta.cosmic-soundcloud.metainfo.xml`)
+3. Commit and push
+4. Create and push a version tag:
+
+   ```bash
+   git tag v0.1.0
+   git push origin v0.1.0
+   ```
+
+The [release workflow](.github/workflows/release.yml) will automatically:
+
+- Build a `.deb` package for Debian/Ubuntu
+- Build a `.flatpak` bundle
+- Create a GitHub Release with both artifacts
+- Extract release notes from the metainfo file
+
+### Flatpak Repository
+
+The [flatpak-repo workflow](.github/workflows/flatpak-repo.yml) publishes the Flatpak to GitHub Pages on each release, creating a Flatpak repository users can add:
+
+```bash
+flatpak remote-add --if-not-exists cosmic-soundcloud https://orta.github.io/cosmic-soundcloud
+flatpak install cosmic-soundcloud com.github.orta.cosmic-soundcloud
+```
+
+Note: You'll need to enable GitHub Pages in your repository settings (Settings → Pages → Source: GitHub Actions).
+
 [fluent]: https://projectfluent.org/
 [fluent-guide]: https://projectfluent.org/fluent/guide/hello.html
 [iso-codes]: https://en.wikipedia.org/wiki/List_of_ISO_639-1_codes
