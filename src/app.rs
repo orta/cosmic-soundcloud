@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use crate::api::{Album, Playlist, SoundCloudClient, Track, User};
-use crate::audio::{open_in_browser, AudioCommand, AudioEvent, AudioPlayer};
+use crate::audio::{open_in_browser, system_volume, AudioCommand, AudioEvent, AudioPlayer};
 use crate::config::{Config, RecentArtist};
 use crate::fl;
 use crate::keyring;
@@ -9,6 +9,7 @@ use cosmic::app::context_drawer;
 use cosmic::cosmic_config::{self, CosmicConfigEntry};
 use cosmic::iced::alignment::{Horizontal, Vertical};
 use cosmic::iced::futures::SinkExt;
+use cosmic::iced::keyboard::{self, key::Named};
 use cosmic::iced::{Alignment, Length, Subscription};
 use cosmic::widget::{self, about::About, icon, image, menu, nav_bar, segmented_button};
 use cosmic::{iced_futures, prelude::*, Element};
@@ -141,6 +142,8 @@ pub struct AppModel {
     current_playlist: Vec<Track>,
     playlist_index: usize,
     volume: f32,
+    /// Current playback position in seconds
+    playback_position: f32,
 
     // === Artwork Cache ===
     artwork_cache: HashMap<String, image::Handle>,
@@ -281,7 +284,8 @@ impl cosmic::Application for AppModel {
             })
             .unwrap_or_default();
 
-        let volume = config.volume;
+        // Get system volume, fallback to config volume if unavailable
+        let volume = system_volume::get_volume().unwrap_or(config.volume);
 
         // Check if we have a saved token in keyring
         // Also migrate any token from old config storage to keyring
@@ -346,6 +350,7 @@ impl cosmic::Application for AppModel {
             current_playlist: Vec::new(),
             playlist_index: 0,
             volume,
+            playback_position: 0.0,
             artwork_cache: HashMap::new(),
             artwork_loading: HashSet::new(),
             // Artist page state
@@ -443,6 +448,11 @@ impl cosmic::Application for AppModel {
                 |url| Message::LaunchUrl(url.to_string()),
                 Message::ToggleContextPage(ContextPage::About),
             ),
+            ContextPage::Queue => context_drawer::context_drawer(
+                self.view_queue(),
+                Message::ToggleContextPage(ContextPage::Queue),
+            )
+            .title(fl!("queue")),
         })
     }
 
@@ -483,6 +493,21 @@ impl cosmic::Application for AppModel {
                     let _ = emitter.send(Message::AudioEvent(event)).await;
                 }
             })
+        }));
+
+        // Keyboard shortcuts for media controls
+        subscriptions.push(keyboard::on_key_press(|key, _modifiers| {
+            match key.as_ref() {
+                // Media keys
+                keyboard::Key::Named(Named::MediaPlayPause) => Some(Message::TogglePlayPause),
+                keyboard::Key::Named(Named::MediaPlay) => Some(Message::TogglePlayPause),
+                keyboard::Key::Named(Named::MediaPause) => Some(Message::TogglePlayPause),
+                keyboard::Key::Named(Named::MediaTrackNext) => Some(Message::NextTrack),
+                keyboard::Key::Named(Named::MediaTrackPrevious) => Some(Message::PreviousTrack),
+                // Space bar for play/pause (note: may conflict with text inputs)
+                keyboard::Key::Named(Named::Space) => Some(Message::TogglePlayPause),
+                _ => None,
+            }
         }));
 
         Subscription::batch(subscriptions)
@@ -773,6 +798,7 @@ impl cosmic::Application for AppModel {
                 self.current_playlist = playlist;
                 self.playlist_index = index;
                 self.playback_status = PlaybackStatus::Buffering;
+                self.playback_position = 0.0;
 
                 // Load artwork if not cached
                 let mut tasks = Vec::new();
@@ -804,7 +830,8 @@ impl cosmic::Application for AppModel {
                             .current_track
                             .as_ref()
                             .and_then(|t| t.permalink_url.clone());
-                        let _ = tx.blocking_send(AudioCommand::SetVolume(self.volume));
+                        // Play at full volume - system volume controls actual output
+                        let _ = tx.blocking_send(AudioCommand::SetVolume(1.0));
                         let _ = tx.blocking_send(AudioCommand::Play {
                             stream_url: url,
                             permalink_url,
@@ -819,8 +846,8 @@ impl cosmic::Application for AppModel {
 
             // === Audio Player ===
             Message::AudioReady(tx) => {
-                // Set initial volume
-                let _ = tx.blocking_send(AudioCommand::SetVolume(self.volume));
+                // Play at full volume - system volume controls actual output
+                let _ = tx.blocking_send(AudioCommand::SetVolume(1.0));
                 self.audio_cmd_tx = Some(tx);
             }
 
@@ -833,6 +860,7 @@ impl cosmic::Application for AppModel {
                 }
                 AudioEvent::Stopped => {
                     self.playback_status = PlaybackStatus::Stopped;
+                    self.playback_position = 0.0;
                 }
                 AudioEvent::Buffering(buffering) => {
                     if buffering {
@@ -858,6 +886,9 @@ impl cosmic::Application for AppModel {
                     }
                 }
                 AudioEvent::Ready => {}
+                AudioEvent::Position(pos) => {
+                    self.playback_position = pos;
+                }
             },
 
             Message::TogglePlayPause => {
@@ -924,16 +955,8 @@ impl cosmic::Application for AppModel {
 
             Message::SetVolume(vol) => {
                 self.volume = vol.clamp(0.0, 1.0);
-                if let Some(tx) = &self.audio_cmd_tx {
-                    let _ = tx.blocking_send(AudioCommand::SetVolume(self.volume));
-                }
-                // Save to config
-                self.config.volume = self.volume;
-                if let Ok(config_context) =
-                    cosmic_config::Config::new(Self::APP_ID, Config::VERSION)
-                {
-                    let _ = self.config.write_entry(&config_context);
-                }
+                // Set system volume instead of internal player volume
+                system_volume::set_volume(self.volume);
             }
 
             // === Artwork ===
@@ -1548,30 +1571,78 @@ impl AppModel {
             .spacing(space_s)
             .align_y(Alignment::Center);
 
-        // Status text
-        let status_text = match self.playback_status {
-            PlaybackStatus::Playing => "Playing",
-            PlaybackStatus::Paused => "Paused",
-            PlaybackStatus::Buffering => "Buffering...",
-            PlaybackStatus::Stopped => "Stopped",
+        // Progress display
+        let progress_display: Element<_> = if let Some(track) = &self.current_track {
+            let duration_secs = track.duration as f32 / 1000.0;
+            let position_secs = self.playback_position;
+
+            // Format time as MM:SS
+            let format_time = |secs: f32| -> String {
+                let total_secs = secs as u64;
+                let mins = total_secs / 60;
+                let secs = total_secs % 60;
+                format!("{mins}:{secs:02}")
+            };
+
+            let progress_ratio = if duration_secs > 0.0 {
+                (position_secs / duration_secs).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+
+            let time_text = format!(
+                "{} / {}",
+                format_time(position_secs),
+                format_time(duration_secs)
+            );
+
+            widget::column::with_capacity(2)
+                .push(
+                    widget::progress_bar(0.0..=1.0, progress_ratio)
+                        .width(Length::Fixed(200.0))
+                        .height(Length::Fixed(4.0)),
+                )
+                .push(widget::text::caption(time_text))
+                .spacing(space_s / 2)
+                .align_x(Alignment::Center)
+                .into()
+        } else {
+            let status_text = match self.playback_status {
+                PlaybackStatus::Playing => "Playing",
+                PlaybackStatus::Paused => "Paused",
+                PlaybackStatus::Buffering => "Buffering...",
+                PlaybackStatus::Stopped => "Stopped",
+            };
+            widget::text::caption(status_text).into()
         };
 
         let center = widget::column::with_capacity(2)
             .push(controls)
-            .push(widget::text::caption(status_text))
+            .push(progress_display)
+            .spacing(space_s / 2)
             .align_x(Alignment::Center);
 
-        // Right: Volume
-        let volume_control = widget::row::with_capacity(2)
+        // Right: Volume and Queue toggle
+        let volume_control = widget::row::with_capacity(4)
             .push(
                 widget::icon::from_name("audio-volume-high-symbolic")
                     .size(16)
                     .apply(Element::from),
             )
             .push(
-                widget::slider(0.0..=1.0, self.volume, Message::SetVolume).width(Length::Fixed(
-                    100.0,
-                )),
+                widget::slider(0.0..=1.0, self.volume, Message::SetVolume)
+                    .step(0.1)
+                    .width(Length::Fixed(100.0)),
+            )
+            .push(widget::horizontal_space().width(Length::Fixed(space_s as f32)))
+            .push(
+                widget::button::icon(widget::icon::from_name("view-list-symbolic"))
+                    .on_press(Message::ToggleContextPage(ContextPage::Queue))
+                    .class(if self.context_page == ContextPage::Queue && self.core.window.show_context {
+                        cosmic::theme::Button::Suggested
+                    } else {
+                        cosmic::theme::Button::Standard
+                    }),
             )
             .spacing(space_s)
             .align_y(Alignment::Center);
@@ -1831,9 +1902,11 @@ impl AppModel {
                 .apply(Element::from)
         };
 
-        // Clone values to avoid lifetime issues
+        // Clone values to avoid lifetime issues - limit to ~3 lines
         let title_text = album.title.clone();
-        let title = widget::text::body(title_text).width(Length::Fixed(80.0));
+        let title = widget::container(widget::text::body(title_text).width(Length::Fixed(80.0)))
+            .max_height(54.0)
+            .clip(true);
 
         let release_info: Element<_> = if let Some(release_date) = &album.release_date {
             // Extract year from date string (e.g., "2024-01-15" -> "2024")
@@ -2362,11 +2435,13 @@ impl AppModel {
                 .apply(Element::from)
         };
 
-        // Clone data to avoid lifetime issues
+        // Clone data to avoid lifetime issues - limit title to ~3 lines
         let title_text = playlist.title.clone();
         let track_count = playlist.track_count;
 
-        let title = widget::text::body(title_text).width(Length::Fixed(120.0));
+        let title = widget::container(widget::text::body(title_text).width(Length::Fixed(120.0)))
+            .max_height(54.0)
+            .clip(true);
         let subtitle = widget::text::caption(format!("{track_count} tracks"));
 
         let card_content = widget::column::with_capacity(3)
@@ -2382,6 +2457,79 @@ impl AppModel {
             .padding(space_s)
             .into()
     }
+
+    /// View for the queue sidebar showing upcoming tracks
+    fn view_queue(&self) -> Element<'_, Message> {
+        let space_s = cosmic::theme::spacing().space_s;
+        let space_m = cosmic::theme::spacing().space_m;
+
+        if self.current_playlist.is_empty() {
+            return widget::container(
+                widget::text::body("No tracks in queue")
+            )
+            .width(Length::Fill)
+            .padding(space_m)
+            .into();
+        }
+
+        // Build list of tracks, highlighting the current one
+        let mut items = widget::column::with_capacity(self.current_playlist.len())
+            .spacing(space_s);
+
+        for (idx, track) in self.current_playlist.iter().enumerate() {
+            let is_current = idx == self.playlist_index;
+
+            // Track number and title
+            let track_num = widget::text::caption(format!("{}.", idx + 1))
+                .width(Length::Fixed(24.0));
+
+            let track_title = if is_current {
+                widget::text::body(&track.title)
+                    .class(cosmic::style::Text::Accent)
+            } else {
+                widget::text::body(&track.title)
+            };
+
+            let track_artist = widget::text::caption(&track.user.username);
+
+            let track_duration = widget::text::caption(track.duration_formatted());
+
+            let track_info = widget::column::with_capacity(2)
+                .push(track_title)
+                .push(track_artist);
+
+            let row = widget::row::with_capacity(3)
+                .push(track_num)
+                .push(track_info.width(Length::Fill))
+                .push(track_duration)
+                .spacing(space_s)
+                .align_y(Alignment::Center)
+                .padding([space_s / 2, 0]);
+
+            // Make tracks clickable to play them
+            let track_clone = track.clone();
+            let playlist_clone = self.current_playlist.clone();
+            let item: Element<_> = widget::button::custom(row)
+                .on_press(Message::PlayTrackInPlaylist(track_clone, playlist_clone, idx))
+                .class(if is_current {
+                    cosmic::theme::Button::HeaderBar
+                } else {
+                    cosmic::theme::Button::Text
+                })
+                .width(Length::Fill)
+                .into();
+
+            items = items.push(item);
+        }
+
+        widget::scrollable(
+            widget::container(items)
+                .padding([0, space_m])
+                .width(Length::Fill)
+        )
+        .height(Length::Fill)
+        .into()
+    }
 }
 
 /// The context page to display in the context drawer.
@@ -2389,6 +2537,8 @@ impl AppModel {
 pub enum ContextPage {
     #[default]
     About,
+    /// Shows upcoming tracks in the current playlist
+    Queue,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

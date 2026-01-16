@@ -42,6 +42,8 @@ pub enum AudioEvent {
     Error(String),
     /// DRM-protected content detected - includes track URL for browser fallback
     DrmProtected { drm_type: String, track_url: String },
+    /// Playback position update (elapsed seconds)
+    Position(f32),
 }
 
 /// Audio player that runs in a background thread
@@ -52,6 +54,12 @@ pub struct AudioPlayer {
     volume: f32,
     event_tx: mpsc::Sender<AudioEvent>,
     http_client: Client,
+    /// Time when playback started (for position tracking)
+    playback_start: Option<std::time::Instant>,
+    /// Accumulated time from before pause (for accurate position after pause/resume)
+    accumulated_time: f32,
+    /// Whether currently paused
+    is_paused: bool,
 }
 
 impl AudioPlayer {
@@ -91,6 +99,9 @@ impl AudioPlayer {
                 volume: 0.8,
                 event_tx: evt_tx.clone(),
                 http_client: Client::new(),
+                playback_start: None,
+                accumulated_time: 0.0,
+                is_paused: false,
             };
 
             // Signal ready
@@ -139,7 +150,17 @@ impl AudioPlayer {
                             {
                                 eprintln!("Track finished playing");
                                 was_playing = false;
+                                player.playback_start = None;
+                                player.accumulated_time = 0.0;
                                 let _ = player.event_tx.send(AudioEvent::Finished).await;
+                            }
+
+                            // Emit position update if playing
+                            if was_playing && !player.is_paused {
+                                if let Some(start) = player.playback_start {
+                                    let elapsed = start.elapsed().as_secs_f32() + player.accumulated_time;
+                                    let _ = player.event_tx.send(AudioEvent::Position(elapsed)).await;
+                                }
                             }
                         }
                     }
@@ -228,6 +249,10 @@ impl AudioPlayer {
                 sink.set_volume(self.volume);
                 sink.append(source);
                 self.sink = Some(sink);
+                // Start position tracking
+                self.playback_start = Some(std::time::Instant::now());
+                self.accumulated_time = 0.0;
+                self.is_paused = false;
                 let _ = self.event_tx.send(AudioEvent::Playing).await;
             }
             Err(e) => {
@@ -243,6 +268,11 @@ impl AudioPlayer {
     async fn pause(&mut self) {
         if let Some(sink) = &self.sink {
             sink.pause();
+            // Track accumulated time before pause
+            if let Some(start) = self.playback_start.take() {
+                self.accumulated_time += start.elapsed().as_secs_f32();
+            }
+            self.is_paused = true;
             let _ = self.event_tx.send(AudioEvent::Paused).await;
         }
     }
@@ -250,6 +280,9 @@ impl AudioPlayer {
     async fn resume(&mut self) {
         if let Some(sink) = &self.sink {
             sink.play();
+            // Restart the timer from now
+            self.playback_start = Some(std::time::Instant::now());
+            self.is_paused = false;
             let _ = self.event_tx.send(AudioEvent::Playing).await;
         }
     }
@@ -257,6 +290,9 @@ impl AudioPlayer {
     async fn stop(&mut self) {
         if let Some(sink) = self.sink.take() {
             sink.stop();
+            self.playback_start = None;
+            self.accumulated_time = 0.0;
+            self.is_paused = false;
             let _ = self.event_tx.send(AudioEvent::Stopped).await;
         }
     }
@@ -438,6 +474,10 @@ impl AudioPlayer {
                 sink.set_volume(self.volume);
                 sink.append(source);
                 self.sink = Some(sink);
+                // Start position tracking
+                self.playback_start = Some(std::time::Instant::now());
+                self.accumulated_time = 0.0;
+                self.is_paused = false;
                 let _ = self.event_tx.send(AudioEvent::Playing).await;
             }
             Err(e) => {

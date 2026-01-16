@@ -2,6 +2,7 @@
 
 mod hls;
 mod player;
+pub mod system_volume;
 mod webview_player;
 mod ytdlp;
 
