@@ -19,6 +19,84 @@ use tokio::sync::mpsc;
 const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
 const APP_ICON: &[u8] = include_bytes!("../resources/icons/hicolor/scalable/apps/com.github.orta.cosmic-soundcloud.svg");
 
+/// Format a number with comma separators (e.g., 1234567 -> "1,234,567")
+fn format_number(n: u32) -> String {
+    let s = n.to_string();
+    let mut result = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            result.push(',');
+        }
+        result.push(c);
+    }
+    result
+}
+
+/// Extract a 4-digit year from a date string like "2024-01-15"
+fn extract_year(date: Option<&str>) -> Option<u32> {
+    date?.split('-').next()?.parse().ok()
+}
+
+/// De-duplicate albums based on preview track titles.
+/// Albums sharing the same set of preview track names are considered duplicates.
+/// Prefers more tracks, or the latest release if years differ by more than 2.
+fn dedup_albums(albums: Vec<Album>, previews: &HashMap<u64, Vec<String>>) -> Vec<Album> {
+    // Build a fingerprint per album from sorted preview track titles
+    let mut fingerprints: HashMap<u64, String> = HashMap::new();
+    for album in &albums {
+        let fp = match previews.get(&album.id) {
+            Some(titles) if !titles.is_empty() => {
+                let mut sorted = titles.clone();
+                sorted.sort();
+                sorted.join("|")
+            }
+            _ => format!("__unique_{}", album.id),
+        };
+        fingerprints.insert(album.id, fp);
+    }
+
+    // Group albums by fingerprint and pick the best from each group
+    let mut groups: HashMap<&str, Vec<&Album>> = HashMap::new();
+    for album in &albums {
+        let fp = fingerprints.get(&album.id).unwrap();
+        groups.entry(fp.as_str()).or_default().push(album);
+    }
+
+    let mut winners: HashSet<u64> = HashSet::new();
+    for group in groups.values() {
+        let best = pick_best_album(group);
+        winners.insert(best);
+    }
+
+    // Return albums in original order, keeping only winners
+    albums.into_iter().filter(|a| winners.contains(&a.id)).collect()
+}
+
+/// Given a group of duplicate albums, return the id of the preferred one.
+fn pick_best_album(albums: &[&Album]) -> u64 {
+    let mut best = albums[0];
+    for &album in &albums[1..] {
+        let best_year = extract_year(best.release_date.as_deref());
+        let album_year = extract_year(album.release_date.as_deref());
+
+        // If years differ by more than 2, prefer the latest
+        if let (Some(by), Some(ay)) = (best_year, album_year) {
+            if (i64::from(ay) - i64::from(by)).unsigned_abs() > 2 {
+                if ay > by {
+                    best = album;
+                }
+                continue;
+            }
+        }
+
+        // Otherwise prefer more tracks
+        if album.track_count > best.track_count {
+            best = album;
+        }
+    }
+    best.id
+}
+
 /// Authentication state
 #[derive(Debug, Clone, Default)]
 pub enum AuthState {
@@ -268,6 +346,7 @@ pub enum Message {
     NavigateToLibrary,
     ArtistLoaded(Result<User, String>),
     ArtistAlbumsLoaded(Result<Vec<Album>, String>),
+    ArtistAlbumsDeduped(Vec<Album>),
     ArtistTracksLoaded(Result<(Vec<Track>, Option<String>), String>),
     LoadMoreArtistTracks,
     SwitchArtistTab(segmented_button::Entity),
@@ -1180,12 +1259,47 @@ impl cosmic::Application for AppModel {
                         })
                         .collect();
 
-                    self.artist_albums = albums;
+                    self.artist_albums = albums.clone();
 
-                    if !artwork_tasks.is_empty() {
-                        return Task::batch(artwork_tasks);
+                    // Spawn dedup task: fetch preview tracks for each album and remove duplicates
+                    let dedup_task = if let Some(client) = &self.api_client {
+                        let client = client.clone();
+                        Some(
+                            cosmic::task::future(async move {
+                                let mut previews: HashMap<u64, Vec<String>> = HashMap::new();
+                                for album in &albums {
+                                    match client.get_album_preview_titles(album.id).await {
+                                        Ok(titles) => {
+                                            previews.insert(album.id, titles);
+                                        }
+                                        Err(e) => {
+                                            eprintln!(
+                                                "[dedup] Failed to fetch preview for album {}: {e}",
+                                                album.id
+                                            );
+                                        }
+                                    }
+                                }
+                                Message::ArtistAlbumsDeduped(dedup_albums(albums, &previews))
+                            })
+                            .map(cosmic::Action::App),
+                        )
+                    } else {
+                        None
+                    };
+
+                    let mut tasks = artwork_tasks;
+                    if let Some(dedup) = dedup_task {
+                        tasks.push(dedup);
+                    }
+                    if !tasks.is_empty() {
+                        return Task::batch(tasks);
                     }
                 }
+            }
+
+            Message::ArtistAlbumsDeduped(albums) => {
+                self.artist_albums = albums;
             }
 
             Message::ArtistTracksLoaded(result) => {
@@ -1870,7 +1984,7 @@ impl AppModel {
 
         let stats_text = format!(
             "{} tracks · {} followers",
-            user.track_count, user.followers_count
+            format_number(user.track_count), format_number(user.followers_count)
         );
 
         let header = widget::row::with_capacity(3)
@@ -1919,6 +2033,33 @@ impl AppModel {
     fn view_artist_albums(&self) -> Element<'_, Message> {
         let space_m = cosmic::theme::spacing().space_m;
 
+        // Filter albums by selected type
+        let filtered_albums: Vec<&Album> = self
+            .artist_albums
+            .iter()
+            .filter(|album| album.track_count > 0)
+            .filter(|album| match self.artist_album_filter.set_type_value() {
+                Some(type_value) => album.set_type.as_deref() == Some(type_value),
+                None => true,
+            })
+            .collect();
+
+        // Summary heading: "12 albums 2012–2024"
+        let heading_text = {
+            let count = filtered_albums.len();
+            let years: Vec<u32> = filtered_albums
+                .iter()
+                .filter_map(|a| extract_year(a.release_date.as_deref()))
+                .collect();
+            let min_year = years.iter().min();
+            let max_year = years.iter().max();
+            match (min_year, max_year) {
+                (Some(min), Some(max)) if min == max => format!("{count} albums · {min}"),
+                (Some(min), Some(max)) => format!("{count} albums · {min}–{max}"),
+                _ => format!("{count} albums"),
+            }
+        };
+
         // Filter dropdown in the top-right
         let selected_index = AlbumTypeFilter::all()
             .iter()
@@ -1930,21 +2071,11 @@ impl AppModel {
             Message::SetAlbumTypeFilter,
         );
 
-        let filter_row = widget::row::with_capacity(2)
+        let filter_row = widget::row::with_capacity(3)
+            .push(widget::text::body(heading_text))
             .push(widget::horizontal_space())
             .push(filter_dropdown)
             .align_y(Alignment::Center);
-
-        // Filter albums by selected type
-        let filtered_albums: Vec<&Album> = self
-            .artist_albums
-            .iter()
-            .filter(|album| album.track_count > 0)
-            .filter(|album| match self.artist_album_filter.set_type_value() {
-                Some(type_value) => album.set_type.as_deref() == Some(type_value),
-                None => true,
-            })
-            .collect();
 
         if filtered_albums.is_empty() {
             return widget::column::with_capacity(2)
@@ -2130,7 +2261,7 @@ impl AppModel {
 
     fn view_stat_owned(&self, label: &'static str, count: u32) -> Element<'_, Message> {
         widget::column::with_capacity(2)
-            .push(widget::text::title3(count.to_string()))
+            .push(widget::text::title3(format_number(count)))
             .push(widget::text::caption(label))
             .align_x(Alignment::Center)
             .into()
@@ -2476,7 +2607,7 @@ impl AppModel {
 
         let stats_text = format!(
             "{} tracks · {} followers",
-            user.track_count, user.followers_count
+            format_number(user.track_count), format_number(user.followers_count)
         );
 
         // Clone user data to avoid lifetime issues
