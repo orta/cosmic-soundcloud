@@ -37,20 +37,25 @@ fn extract_year(date: Option<&str>) -> Option<u32> {
     date?.split('-').next()?.parse().ok()
 }
 
-/// De-duplicate albums based on preview track titles.
-/// Albums sharing the same set of preview track names are considered duplicates.
+/// De-duplicate albums based on their inline track stubs.
+/// Albums sharing the same set of track stub titles are considered duplicates.
 /// Prefers more tracks, or the latest release if years differ by more than 2.
-fn dedup_albums(albums: Vec<Album>, previews: &HashMap<u64, Vec<String>>) -> Vec<Album> {
-    // Build a fingerprint per album from sorted preview track titles
+fn dedup_albums(albums: Vec<Album>) -> Vec<Album> {
+    // Build a fingerprint per album from sorted track stub titles
     let mut fingerprints: HashMap<u64, String> = HashMap::new();
     for album in &albums {
-        let fp = match previews.get(&album.id) {
-            Some(titles) if !titles.is_empty() => {
-                let mut sorted = titles.clone();
-                sorted.sort();
-                sorted.join("|")
-            }
-            _ => format!("__unique_{}", album.id),
+        let titles: Vec<String> = album
+            .track_stubs
+            .iter()
+            .filter(|t| t.is_complete())
+            .map(|t| t.title.to_lowercase())
+            .collect();
+        let fp = if titles.is_empty() {
+            format!("__unique_{}", album.id)
+        } else {
+            let mut sorted = titles;
+            sorted.sort();
+            sorted.join("|")
         };
         fingerprints.insert(album.id, fp);
     }
@@ -246,8 +251,6 @@ pub struct AppModel {
     about: About,
     /// Contains items assigned to the nav bar panel.
     nav: nav_bar::Model,
-    /// Key bindings for the application's menu bar.
-    key_binds: HashMap<menu::KeyBind, MenuAction>,
     /// Configuration data that persists between application runs.
     config: Config,
 
@@ -274,6 +277,10 @@ pub struct AppModel {
     volume: f32,
     /// Current playback position in seconds
     playback_position: f32,
+    /// Whether preloading has been triggered for the current track
+    preload_triggered: bool,
+    /// Track ID that has been preloaded into the disk cache
+    preloaded_track_id: Option<u64>,
 
     // === Artwork Cache ===
     artwork_cache: HashMap<String, image::Handle>,
@@ -337,6 +344,10 @@ pub enum Message {
     PreviousTrack,
     SetVolume(f32),
 
+    // Preloading
+    PreloadNextTrack,
+    PreloadStreamUrlLoaded(u64, Result<String, String>),
+
     // Artwork
     LoadArtwork(String),
     ArtworkLoaded(String, Vec<u8>),
@@ -346,7 +357,6 @@ pub enum Message {
     NavigateToLibrary,
     ArtistLoaded(Result<User, String>),
     ArtistAlbumsLoaded(Result<Vec<Album>, String>),
-    ArtistAlbumsDeduped(Vec<Album>),
     ArtistTracksLoaded(Result<(Vec<Track>, Option<String>), String>),
     LoadMoreArtistTracks,
     SwitchArtistTab(segmented_button::Entity),
@@ -470,7 +480,6 @@ impl cosmic::Application for AppModel {
             context_page: ContextPage::default(),
             about,
             nav,
-            key_binds: HashMap::new(),
             config,
             auth_state,
             login_token_input: String::new(),
@@ -487,6 +496,8 @@ impl cosmic::Application for AppModel {
             playlist_index: 0,
             volume,
             playback_position: 0.0,
+            preload_triggered: false,
+            preloaded_track_id: None,
             artwork_cache: HashMap::new(),
             artwork_loading: HashSet::new(),
             // Artist page state
@@ -737,6 +748,11 @@ impl cosmic::Application for AppModel {
                 }
                 self.playback_status = PlaybackStatus::Stopped;
                 self.current_track = None;
+                self.preload_triggered = false;
+                self.preloaded_track_id = None;
+
+                // Clear preloaded audio cache
+                crate::audio::cache::clear_cache();
 
                 // Delete token from keyring (if available)
                 let _ = keyring::delete_token();
@@ -937,6 +953,8 @@ impl cosmic::Application for AppModel {
                 self.playlist_index = index;
                 self.playback_status = PlaybackStatus::Buffering;
                 self.playback_position = 0.0;
+                // Reset preload state for the new track
+                self.preload_triggered = false;
 
                 // Load artwork if not cached
                 let mut tasks = Vec::new();
@@ -964,6 +982,7 @@ impl cosmic::Application for AppModel {
             Message::StreamUrlLoaded(result) => match result {
                 Ok(url) => {
                     if let Some(tx) = &self.audio_cmd_tx {
+                        let track_id = self.current_track.as_ref().map(|t| t.id);
                         let permalink_url = self
                             .current_track
                             .as_ref()
@@ -971,6 +990,7 @@ impl cosmic::Application for AppModel {
                         // Play at full volume - system volume controls actual output
                         let _ = tx.blocking_send(AudioCommand::SetVolume(1.0));
                         let _ = tx.blocking_send(AudioCommand::Play {
+                            track_id,
                             stream_url: url,
                             permalink_url,
                         });
@@ -1026,6 +1046,23 @@ impl cosmic::Application for AppModel {
                 AudioEvent::Ready => {}
                 AudioEvent::Position(pos) => {
                     self.playback_position = pos;
+
+                    // Trigger preloading of the next track at ~25% through
+                    if !self.preload_triggered {
+                        if let Some(track) = &self.current_track {
+                            let duration_secs = track.duration as f32 / 1000.0;
+                            if duration_secs > 0.0 && (pos / duration_secs) >= 0.25 {
+                                self.preload_triggered = true;
+                                return cosmic::task::message(cosmic::Action::App(
+                                    Message::PreloadNextTrack,
+                                ));
+                            }
+                        }
+                    }
+                }
+                AudioEvent::PreloadComplete(track_id) => {
+                    eprintln!("[preload] Preload complete for track {track_id}");
+                    self.preloaded_track_id = Some(track_id);
                 }
             },
 
@@ -1096,6 +1133,63 @@ impl cosmic::Application for AppModel {
                 // Set system volume instead of internal player volume
                 system_volume::set_volume(self.volume);
             }
+
+            // === Preloading ===
+            Message::PreloadNextTrack => {
+                if !self.current_playlist.is_empty() {
+                    let next_index = (self.playlist_index + 1) % self.current_playlist.len();
+                    // Only preload if there's actually a next track to play
+                    if next_index != 0
+                        || self.config.repeat_mode == crate::config::RepeatMode::All
+                    {
+                        let next_track = &self.current_playlist[next_index];
+                        let track_id = next_track.id;
+
+                        // Skip if already preloaded
+                        if self.preloaded_track_id == Some(track_id) {
+                            eprintln!("[preload] Track {track_id} already preloaded, skipping");
+                        } else if let Some(client) = &self.api_client {
+                            eprintln!("[preload] Resolving stream URL for next track {track_id}");
+                            let client = client.clone();
+                            let track = next_track.clone();
+                            return cosmic::task::future(async move {
+                                match client.get_stream_url(&track).await {
+                                    Ok(url) => Message::PreloadStreamUrlLoaded(
+                                        track_id,
+                                        Ok(url),
+                                    ),
+                                    Err(e) => Message::PreloadStreamUrlLoaded(
+                                        track_id,
+                                        Err(e.to_string()),
+                                    ),
+                                }
+                            })
+                            .map(cosmic::Action::App);
+                        }
+                    }
+                }
+            }
+
+            Message::PreloadStreamUrlLoaded(track_id, result) => match result {
+                Ok(stream_url) => {
+                    if let Some(tx) = &self.audio_cmd_tx {
+                        let permalink_url = self
+                            .current_playlist
+                            .iter()
+                            .find(|t| t.id == track_id)
+                            .and_then(|t| t.permalink_url.clone());
+                        eprintln!("[preload] Sending preload command for track {track_id}");
+                        let _ = tx.blocking_send(AudioCommand::Preload {
+                            track_id,
+                            stream_url,
+                            permalink_url,
+                        });
+                    }
+                }
+                Err(err) => {
+                    eprintln!("[preload] Failed to get stream URL for track {track_id}: {err}");
+                }
+            },
 
             // === Artwork ===
             Message::LoadArtwork(url) => {
@@ -1251,47 +1345,12 @@ impl cosmic::Application for AppModel {
                         })
                         .collect();
 
-                    self.artist_albums = albums.clone();
+                    self.artist_albums = dedup_albums(albums);
 
-                    // Spawn dedup task: fetch preview tracks for each album and remove duplicates
-                    let dedup_task = if let Some(client) = &self.api_client {
-                        let client = client.clone();
-                        Some(
-                            cosmic::task::future(async move {
-                                let mut previews: HashMap<u64, Vec<String>> = HashMap::new();
-                                for album in &albums {
-                                    match client.get_album_preview_titles(album.id).await {
-                                        Ok(titles) => {
-                                            previews.insert(album.id, titles);
-                                        }
-                                        Err(e) => {
-                                            eprintln!(
-                                                "[dedup] Failed to fetch preview for album {}: {e}",
-                                                album.id
-                                            );
-                                        }
-                                    }
-                                }
-                                Message::ArtistAlbumsDeduped(dedup_albums(albums, &previews))
-                            })
-                            .map(cosmic::Action::App),
-                        )
-                    } else {
-                        None
-                    };
-
-                    let mut tasks = artwork_tasks;
-                    if let Some(dedup) = dedup_task {
-                        tasks.push(dedup);
-                    }
-                    if !tasks.is_empty() {
-                        return Task::batch(tasks);
+                    if !artwork_tasks.is_empty() {
+                        return Task::batch(artwork_tasks);
                     }
                 }
-            }
-
-            Message::ArtistAlbumsDeduped(albums) => {
-                self.artist_albums = albums;
             }
 
             Message::ArtistTracksLoaded(result) => {
@@ -2077,20 +2136,15 @@ impl AppModel {
                 .into();
         }
 
-        // Grid of album cards - rows of 4
-        let mut rows: Vec<Element<_>> = Vec::new();
-        for chunk in filtered_albums.chunks(4) {
-            let mut row = widget::row::with_capacity(4).spacing(space_m);
-            for album in chunk {
-                row = row.push(self.view_album_grid_card(album));
-            }
-            for _ in chunk.len()..4 {
-                row = row.push(widget::horizontal_space());
-            }
-            rows.push(row.into());
-        }
+        // Grid of album cards - flex wrap for responsive layout
+        let items: Vec<Element<_>> = filtered_albums
+            .iter()
+            .map(|album| self.view_album_grid_card(album))
+            .collect();
 
-        let grid = widget::column::with_children(rows).spacing(space_m);
+        let grid = widget::flex_row(items)
+            .column_spacing(space_m)
+            .row_spacing(space_m);
 
         widget::column::with_capacity(2)
             .push(filter_row)
@@ -2126,7 +2180,7 @@ impl AppModel {
         let title = widget::container(
             widget::text::body(title_text).width(Length::Fixed(120.0)),
         )
-        .max_height(54.0)
+        .max_height(66.0)
         .clip(true);
 
         // Subtitle: "2024 · 12 tracks"
@@ -2639,23 +2693,16 @@ impl AppModel {
         } else if self.recommendations.is_empty() {
             widget::text::body("No recommendations available.").into()
         } else {
-            // Grid of playlist cards - build rows of 4
-            let mut rows: Vec<Element<_>> = Vec::new();
-            let playlists: Vec<_> = self.recommendations.iter().collect();
+            // Grid of playlist cards - flex wrap for responsive layout
+            let items: Vec<Element<_>> = self
+                .recommendations
+                .iter()
+                .map(|playlist| self.view_playlist_card(playlist))
+                .collect();
 
-            for chunk in playlists.chunks(4) {
-                let mut row = widget::row::with_capacity(4).spacing(space_m);
-                for playlist in chunk {
-                    row = row.push(self.view_playlist_card(playlist));
-                }
-                // Fill remaining space if less than 4 items
-                for _ in chunk.len()..4 {
-                    row = row.push(widget::horizontal_space());
-                }
-                rows.push(row.into());
-            }
-
-            let grid = widget::column::with_children(rows).spacing(space_m);
+            let grid = widget::flex_row(items)
+                .column_spacing(space_m)
+                .row_spacing(space_m);
 
             // Add bottom padding for player bar clearance
             let padded_grid = widget::container(grid).padding([0, space_m as u16, 120, 0]);

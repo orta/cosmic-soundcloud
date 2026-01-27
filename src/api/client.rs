@@ -247,38 +247,6 @@ impl SoundCloudClient {
         Ok(all_tracks)
     }
 
-    /// Get preview track titles from an album/playlist (the ~5 complete tracks SoundCloud embeds)
-    pub async fn get_album_preview_titles(&self, album_id: u64) -> Result<Vec<String>, ApiError> {
-        let url = self.url_with_client_id(&format!("/playlists/{album_id}"));
-        let response = self
-            .http
-            .get(&url)
-            .header("Authorization", self.auth_header())
-            .send()
-            .await?;
-
-        if response.status() == 401 {
-            return Err(ApiError::Unauthorized);
-        }
-        if response.status() == 404 {
-            return Err(ApiError::NotFound);
-        }
-
-        let playlist: super::types::PlaylistWithTracks = response
-            .json()
-            .await
-            .map_err(|e| ApiError::Json(e.to_string()))?;
-
-        let titles: Vec<String> = playlist
-            .tracks
-            .iter()
-            .filter(|t| t.is_complete())
-            .map(|t| t.title.to_lowercase())
-            .collect();
-
-        Ok(titles)
-    }
-
     /// Get tracks from a playlist/album
     pub async fn get_playlist_tracks(&self, playlist_id: u64) -> Result<Vec<Track>, ApiError> {
         let url = self.url_with_client_id(&format!("/playlists/{playlist_id}"));

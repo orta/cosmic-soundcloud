@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use super::{hls, ytdlp};
+use super::{cache, hls, ytdlp};
 use reqwest::Client;
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink};
 use std::io::Cursor;
@@ -11,8 +11,18 @@ use tokio::sync::mpsc;
 /// Commands sent to the audio player thread
 #[derive(Debug, Clone)]
 pub enum AudioCommand {
-    /// Play audio from a stream URL, with optional permalink URL for browser fallback
-    Play { stream_url: String, permalink_url: Option<String> },
+    /// Play audio from a stream URL, with optional track ID for cache lookup
+    Play {
+        track_id: Option<u64>,
+        stream_url: String,
+        permalink_url: Option<String>,
+    },
+    /// Preload audio data for a track into the disk cache without playing
+    Preload {
+        track_id: u64,
+        stream_url: String,
+        permalink_url: Option<String>,
+    },
     /// Pause playback
     Pause,
     /// Resume playback
@@ -44,6 +54,8 @@ pub enum AudioEvent {
     DrmProtected { drm_type: String, track_url: String },
     /// Playback position update (elapsed seconds)
     Position(f32),
+    /// Preloading complete for the given track ID
+    PreloadComplete(u64),
 }
 
 /// Audio player that runs in a background thread
@@ -122,9 +134,12 @@ impl AudioPlayer {
                     tokio::select! {
                         cmd = cmd_rx.recv() => {
                             match cmd {
-                                Some(AudioCommand::Play { stream_url, permalink_url }) => {
-                                    player.play_url(&stream_url, permalink_url.as_deref()).await;
+                                Some(AudioCommand::Play { track_id, stream_url, permalink_url }) => {
+                                    player.play_url(track_id, &stream_url, permalink_url.as_deref()).await;
                                     was_playing = true;
+                                }
+                                Some(AudioCommand::Preload { track_id, stream_url, permalink_url }) => {
+                                    player.preload(track_id, &stream_url, permalink_url.as_deref()).await;
                                 }
                                 Some(AudioCommand::Pause) => {
                                     player.pause().await;
@@ -171,11 +186,25 @@ impl AudioPlayer {
         (cmd_tx, evt_rx)
     }
 
-    async fn play_url(&mut self, url: &str, permalink_url: Option<&str>) {
+    async fn play_url(&mut self, track_id: Option<u64>, url: &str, permalink_url: Option<&str>) {
         // Stop any existing playback
         self.stop().await;
 
         eprintln!("play_url: {}...", &url[..url.len().min(80)]);
+
+        // Check if we have cached audio data for this track
+        if let Some(id) = track_id
+            && cache::has_cached(id)
+        {
+            eprintln!("  -> Found cached audio for track {id}, playing from cache");
+            if let Some(data) = cache::read_cached(id) {
+                self.play_from_data(data).await;
+                // Clean up cache file after loading into player
+                cache::remove_cached(id);
+                return;
+            }
+            eprintln!("  -> Cache read failed, falling back to download");
+        }
 
         let _ = self.event_tx.send(AudioEvent::Buffering(true)).await;
 
@@ -263,6 +292,144 @@ impl AudioPlayer {
                     .await;
             }
         }
+    }
+
+    /// Play audio directly from in-memory data (used for cached tracks)
+    async fn play_from_data(&mut self, data: Vec<u8>) {
+        let _ = self.event_tx.send(AudioEvent::Buffering(true)).await;
+
+        let cursor = Cursor::new(data);
+        let source = match Decoder::new(cursor) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("  -> Decode cached data FAILED: {e}");
+                let _ = self
+                    .event_tx
+                    .send(AudioEvent::Error(format!("Failed to decode cached audio: {e}")))
+                    .await;
+                let _ = self.event_tx.send(AudioEvent::Buffering(false)).await;
+                return;
+            }
+        };
+
+        let _ = self.event_tx.send(AudioEvent::Buffering(false)).await;
+
+        match Sink::try_new(&self.stream_handle) {
+            Ok(sink) => {
+                eprintln!("  -> Playing from cache!");
+                sink.set_volume(self.volume);
+                sink.append(source);
+                self.sink = Some(sink);
+                self.playback_start = Some(std::time::Instant::now());
+                self.accumulated_time = 0.0;
+                self.is_paused = false;
+                let _ = self.event_tx.send(AudioEvent::Playing).await;
+            }
+            Err(e) => {
+                eprintln!("  -> Sink creation FAILED: {e}");
+                let _ = self
+                    .event_tx
+                    .send(AudioEvent::Error(format!("Failed to create sink: {e}")))
+                    .await;
+            }
+        }
+    }
+
+    /// Preload audio data for a track into the disk cache without playing it.
+    /// Downloads the audio data (HLS segments or progressive stream) and writes
+    /// it to ~/.cache/cosmic-soundcloud/audio/{track_id}.audio
+    async fn preload(&mut self, track_id: u64, url: &str, permalink_url: Option<&str>) {
+        // Skip if already cached
+        if cache::has_cached(track_id) {
+            eprintln!("[preload] Track {track_id} already cached, skipping");
+            let _ = self.event_tx.send(AudioEvent::PreloadComplete(track_id)).await;
+            return;
+        }
+
+        eprintln!("[preload] Starting preload for track {track_id}: {}...", &url[..url.len().min(80)]);
+
+        let audio_data = if url.contains(".m3u8") {
+            self.download_hls_data(url, permalink_url).await
+        } else {
+            self.download_progressive_data(url).await
+        };
+
+        match audio_data {
+            Some(data) if !data.is_empty() => {
+                match cache::write_cached(track_id, &data) {
+                    Ok(()) => {
+                        eprintln!("[preload] Track {track_id} cached ({} bytes)", data.len());
+                        let _ = self.event_tx.send(AudioEvent::PreloadComplete(track_id)).await;
+                    }
+                    Err(e) => {
+                        eprintln!("[preload] Failed to write cache for track {track_id}: {e}");
+                    }
+                }
+            }
+            _ => {
+                eprintln!("[preload] Failed to download audio data for track {track_id}");
+            }
+        }
+    }
+
+    /// Download HLS audio data without playing it. Returns the concatenated segment bytes.
+    async fn download_hls_data(&self, url: &str, permalink_url: Option<&str>) -> Option<Vec<u8>> {
+        let playlist = hls::fetch_playlist(&self.http_client, url).await.ok()?;
+
+        // Handle encryption - try yt-dlp fallback if needed
+        if let Some(enc) = &playlist.encryption {
+            let is_commercial_drm = enc.keyformat.as_ref().is_some_and(|k| {
+                k.contains("playready")
+                    || k.contains("widevine")
+                    || k.contains("fairplay")
+                    || k.contains("urn:uuid")
+            });
+
+            if is_commercial_drm || (enc.method.contains("AES") && enc.uri.is_some()) {
+                // Try yt-dlp for encrypted content
+                if let Some(track_url) = permalink_url
+                    && !track_url.is_empty()
+                {
+                    if let Ok(ytdlp_url) = ytdlp::extract_stream_url(track_url) {
+                        let fallback_playlist = hls::fetch_playlist(&self.http_client, &ytdlp_url).await.ok()?;
+                        return self.download_hls_segments(&fallback_playlist).await;
+                    }
+                }
+                return None;
+            }
+        }
+
+        self.download_hls_segments(&playlist).await
+    }
+
+    /// Download all HLS segments and return concatenated bytes.
+    async fn download_hls_segments(&self, playlist: &hls::HlsStream) -> Option<Vec<u8>> {
+        if playlist.segments.is_empty() {
+            return None;
+        }
+
+        let mut audio_data = Vec::new();
+
+        // Download init segment if present
+        if let Some(init_url) = &playlist.init_segment_url {
+            let data = hls::download_segment(&self.http_client, init_url).await.ok()?;
+            audio_data.extend(data);
+        }
+
+        // Download all segments
+        for segment in &playlist.segments {
+            let data = hls::download_segment(&self.http_client, &segment.uri).await.ok()?;
+            audio_data.extend(data);
+        }
+
+        Some(audio_data)
+    }
+
+    /// Download a progressive stream fully into memory.
+    async fn download_progressive_data(&self, url: &str) -> Option<Vec<u8>> {
+        let response = self.http_client.get(url).send().await.ok()?;
+        let bytes = response.bytes().await.ok()?;
+        Some(bytes.to_vec())
     }
 
     async fn pause(&mut self) {
@@ -403,89 +570,15 @@ impl AudioPlayer {
 
     /// Download and play HLS segments from a parsed playlist
     async fn stream_hls_playlist(&mut self, playlist: &hls::HlsStream) {
-        if playlist.segments.is_empty() {
+        if let Some(audio_data) = self.download_hls_segments(playlist).await {
+            let _ = self.event_tx.send(AudioEvent::Buffering(false)).await;
+            self.play_from_data(audio_data).await;
+        } else {
             let _ = self
                 .event_tx
-                .send(AudioEvent::Error("No segments in playlist".into()))
+                .send(AudioEvent::Error("Failed to download HLS segments".into()))
                 .await;
             let _ = self.event_tx.send(AudioEvent::Buffering(false)).await;
-            return;
-        }
-
-        // Download init segment first if present (for fMP4 streams)
-        let mut audio_data = Vec::new();
-        if let Some(init_url) = &playlist.init_segment_url {
-            eprintln!("Downloading init segment: {}...", &init_url[..init_url.len().min(60)]);
-            match hls::download_segment(&self.http_client, init_url).await {
-                Ok(data) => {
-                    audio_data.extend(data);
-                }
-                Err(e) => {
-                    let _ = self
-                        .event_tx
-                        .send(AudioEvent::Error(format!("Failed to download init segment: {e}")))
-                        .await;
-                    let _ = self.event_tx.send(AudioEvent::Buffering(false)).await;
-                    return;
-                }
-            }
-        }
-
-        // Download all segments
-        let total_segments = playlist.segments.len();
-        eprintln!("Downloading {} segments...", total_segments);
-
-        for (i, segment) in playlist.segments.iter().enumerate() {
-            eprintln!("Downloading segment {}/{}: {}...", i + 1, total_segments, &segment.uri[..segment.uri.len().min(60)]);
-
-            match hls::download_segment(&self.http_client, &segment.uri).await {
-                Ok(data) => {
-                    audio_data.extend(data);
-                }
-                Err(e) => {
-                    let _ = self
-                        .event_tx
-                        .send(AudioEvent::Error(format!("Failed to download segment: {e}")))
-                        .await;
-                    let _ = self.event_tx.send(AudioEvent::Buffering(false)).await;
-                    return;
-                }
-            }
-        }
-
-        let _ = self.event_tx.send(AudioEvent::Buffering(false)).await;
-
-        // Try to decode the concatenated segments
-        let cursor = Cursor::new(audio_data);
-        let source = match Decoder::new(cursor) {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = self
-                    .event_tx
-                    .send(AudioEvent::Error(format!("Failed to decode HLS segments: {e}")))
-                    .await;
-                return;
-            }
-        };
-
-        // Create sink and play
-        match Sink::try_new(&self.stream_handle) {
-            Ok(sink) => {
-                sink.set_volume(self.volume);
-                sink.append(source);
-                self.sink = Some(sink);
-                // Start position tracking
-                self.playback_start = Some(std::time::Instant::now());
-                self.accumulated_time = 0.0;
-                self.is_paused = false;
-                let _ = self.event_tx.send(AudioEvent::Playing).await;
-            }
-            Err(e) => {
-                let _ = self
-                    .event_tx
-                    .send(AudioEvent::Error(format!("Failed to create sink: {e}")))
-                    .await;
-            }
         }
     }
 }

@@ -192,6 +192,9 @@ pub struct Album {
     /// Album type from SoundCloud: "album", "ep", "single", "compilation", etc.
     #[serde(default)]
     pub set_type: Option<String>,
+    /// Stub tracks returned inline by the albums API (may be incomplete — use `Track::is_complete()`)
+    #[serde(default, rename = "tracks")]
+    pub track_stubs: Vec<Track>,
 }
 
 /// Paginated response for albums

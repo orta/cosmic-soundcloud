@@ -36,6 +36,9 @@ parking_lot = "0.12"
 keyring = "3"
 urlencoding = "2.1.3"
 
+# Cache directory
+dirs = "6"
+
 [dependencies.libcosmic]
 git = "https://github.com/pop-os/libcosmic.git"
 # See https://github.com/pop-os/libcosmic/blob/master/Cargo.toml for available features.

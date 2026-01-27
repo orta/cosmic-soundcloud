@@ -1142,6 +1142,7 @@ dependencies = [
 name = "cosmic-soundcloud"
 version = "0.4.0"
 dependencies = [
+ "dirs",
  "futures-util",
  "i18n-embed",
  "i18n-embed-fl",

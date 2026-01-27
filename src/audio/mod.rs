@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
+pub mod cache;
 mod hls;
 mod player;
 pub mod system_volume;
