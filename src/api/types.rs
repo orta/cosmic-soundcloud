@@ -189,6 +189,9 @@ pub struct Album {
     pub release_date: Option<String>,
     pub user: TrackUser,
     pub permalink_url: Option<String>,
+    /// Album type from SoundCloud: "album", "ep", "single", "compilation", etc.
+    #[serde(default)]
+    pub set_type: Option<String>,
 }
 
 /// Paginated response for albums
@@ -216,13 +219,6 @@ pub struct Playlist {
     pub likes_count: u64,
     pub user: TrackUser,
     pub permalink_url: Option<String>,
-}
-
-/// Paginated response for playlists
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct PlaylistsResponse {
-    pub collection: Vec<Playlist>,
-    pub next_href: Option<String>,
 }
 
 /// Search results for users

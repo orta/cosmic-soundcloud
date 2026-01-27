@@ -78,6 +78,58 @@ impl LibraryTab {
     }
 }
 
+/// Artist page tab selection
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ArtistTab {
+    #[default]
+    Albums,
+    Tracks,
+}
+
+impl ArtistTab {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Albums => "Albums",
+            Self::Tracks => "Tracks",
+        }
+    }
+
+    pub fn all() -> &'static [ArtistTab] {
+        &[Self::Albums, Self::Tracks]
+    }
+}
+
+/// Filter for album types on the artist page
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AlbumTypeFilter {
+    #[default]
+    Album,
+    EP,
+    Single,
+    Compilation,
+    All,
+}
+
+impl AlbumTypeFilter {
+    pub fn set_type_value(&self) -> Option<&'static str> {
+        match self {
+            Self::Album => Some("album"),
+            Self::EP => Some("ep"),
+            Self::Single => Some("single"),
+            Self::Compilation => Some("compilation"),
+            Self::All => None,
+        }
+    }
+
+    pub fn all() -> &'static [AlbumTypeFilter] {
+        &[Self::Album, Self::EP, Self::Single, Self::Compilation, Self::All]
+    }
+
+    pub fn all_labels() -> &'static [&'static str] {
+        &["Albums", "EPs", "Singles", "Compilations", "All"]
+    }
+}
+
 /// Navigation page
 #[derive(Debug, Clone, PartialEq)]
 pub enum Page {
@@ -154,6 +206,9 @@ pub struct AppModel {
     artist_user: Option<User>,
     artist_albums: Vec<Album>,
     artist_tracks: PaginatedData<Track>,
+    artist_tab: ArtistTab,
+    artist_tab_model: segmented_button::SingleSelectModel,
+    artist_album_filter: AlbumTypeFilter,
 
     // === Search Page State ===
     search_query: String,
@@ -215,6 +270,8 @@ pub enum Message {
     ArtistAlbumsLoaded(Result<Vec<Album>, String>),
     ArtistTracksLoaded(Result<(Vec<Track>, Option<String>), String>),
     LoadMoreArtistTracks,
+    SwitchArtistTab(segmented_button::Entity),
+    SetAlbumTypeFilter(usize),
 
     // Album Playback
     PlayAlbum(u64),                              // album_id - load tracks and play
@@ -358,6 +415,16 @@ impl cosmic::Application for AppModel {
             artist_user: None,
             artist_albums: Vec::new(),
             artist_tracks: PaginatedData::default(),
+            artist_tab: ArtistTab::default(),
+            artist_tab_model: {
+                let mut model = segmented_button::SingleSelectModel::default();
+                for tab in ArtistTab::all() {
+                    model.insert().text(tab.label()).data(*tab);
+                }
+                model.activate_position(0);
+                model
+            },
+            artist_album_filter: AlbumTypeFilter::default(),
             // Search page state
             search_query: String::new(),
             search_results: PaginatedData::default(),
@@ -1013,7 +1080,10 @@ impl cosmic::Application for AppModel {
                 self.current_page = Page::Artist(user_id);
                 self.artist_user = None;
                 self.artist_albums = Vec::new();
-                self.artist_tracks = PaginatedData::default();
+                self.artist_tracks = PaginatedData { loading: true, ..PaginatedData::default() };
+                self.artist_tab = ArtistTab::default();
+                self.artist_tab_model.activate_position(0);
+                self.artist_album_filter = AlbumTypeFilter::default();
 
                 // Rebuild nav with recent artists
                 self.rebuild_nav();
@@ -1119,31 +1189,37 @@ impl cosmic::Application for AppModel {
             }
 
             Message::ArtistTracksLoaded(result) => {
-                if let Ok((tracks, next_href)) = result {
-                    // Load track artwork
-                    let artwork_tasks: Vec<_> = tracks
-                        .iter()
-                        .filter_map(|track| {
-                            track.artwork_url.as_ref().and_then(|url| {
-                                if !self.artwork_cache.contains_key(url)
-                                    && !self.artwork_loading.contains(url)
-                                {
-                                    Some(cosmic::task::message(cosmic::Action::App(
-                                        Message::LoadArtwork(url.clone()),
-                                    )))
-                                } else {
-                                    None
-                                }
+                match result {
+                    Ok((tracks, next_href)) => {
+                        // Load track artwork
+                        let artwork_tasks: Vec<_> = tracks
+                            .iter()
+                            .filter_map(|track| {
+                                track.artwork_url.as_ref().and_then(|url| {
+                                    if !self.artwork_cache.contains_key(url)
+                                        && !self.artwork_loading.contains(url)
+                                    {
+                                        Some(cosmic::task::message(cosmic::Action::App(
+                                            Message::LoadArtwork(url.clone()),
+                                        )))
+                                    } else {
+                                        None
+                                    }
+                                })
                             })
-                        })
-                        .collect();
+                            .collect();
 
-                    self.artist_tracks.items.extend(tracks);
-                    self.artist_tracks.next_href = next_href;
-                    self.artist_tracks.loading = false;
+                        self.artist_tracks.items.extend(tracks);
+                        self.artist_tracks.next_href = next_href;
+                        self.artist_tracks.loading = false;
 
-                    if !artwork_tasks.is_empty() {
-                        return Task::batch(artwork_tasks);
+                        if !artwork_tasks.is_empty() {
+                            return Task::batch(artwork_tasks);
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!("Failed to load artist tracks: {err}");
+                        self.artist_tracks.loading = false;
                     }
                 }
             }
@@ -1165,6 +1241,19 @@ impl cosmic::Application for AppModel {
                         }
                     })
                     .map(cosmic::Action::App);
+                }
+            }
+
+            Message::SwitchArtistTab(entity) => {
+                self.artist_tab_model.activate(entity);
+                if let Some(tab) = self.artist_tab_model.active_data::<ArtistTab>() {
+                    self.artist_tab = *tab;
+                }
+            }
+
+            Message::SetAlbumTypeFilter(index) => {
+                if let Some(filter) = AlbumTypeFilter::all().get(index) {
+                    self.artist_album_filter = *filter;
                 }
             }
 
@@ -1740,7 +1829,7 @@ impl AppModel {
             .into()
     }
 
-    /// View for artist page showing artist info, albums, and tracks
+    /// View for artist page showing artist info with tabs for albums and tracks
     fn view_artist(&self) -> Element<'_, Message> {
         let space_s = cosmic::theme::spacing().space_s;
         let space_m = cosmic::theme::spacing().space_m;
@@ -1796,78 +1885,25 @@ impl AppModel {
             .spacing(space_m)
             .align_y(Alignment::Center);
 
-        let mut content = widget::column::with_capacity(4)
-            .push(header)
-            .spacing(space_l)
-            .width(Length::Fill);
+        // Tab bar for artist page
+        let tabs = widget::segmented_button::horizontal(&self.artist_tab_model)
+            .on_activate(Message::SwitchArtistTab)
+            .spacing(space_s)
+            .width(Length::Fill)
+            .button_alignment(Alignment::Center);
 
-        // Albums section (if any) - horizontally scrollable for artists with many albums
-        if !self.artist_albums.is_empty() {
-            let album_cards: Vec<Element<_>> = self
-                .artist_albums
-                .iter()
-                .map(|album| self.view_album_card(album))
-                .collect();
-
-            let albums_row = widget::row::with_children(album_cards).spacing(space_m);
-            let albums_scrollable = widget::scrollable::horizontal(albums_row);
-
-            let albums_section = widget::column::with_capacity(2)
-                .push(widget::text::title3("Albums"))
-                .push(albums_scrollable)
-                .spacing(space_s);
-
-            content = content.push(albums_section);
-        }
-
-        // Tracks section
-        let tracks_section = if self.artist_tracks.items.is_empty() && self.artist_tracks.loading {
-            widget::column::with_capacity(2)
-                .push(widget::text::title3("Tracks"))
-                .push(self.view_loading("Loading tracks..."))
-                .spacing(space_s)
-        } else if self.artist_tracks.items.is_empty() {
-            widget::column::with_capacity(2)
-                .push(widget::text::title3("Tracks"))
-                .push(widget::text::body("No tracks found."))
-                .spacing(space_s)
-        } else {
-            // Clone the full track list for playlist context
-            let playlist = self.artist_tracks.items.clone();
-            let track_items: Vec<Element<_>> = self
-                .artist_tracks
-                .items
-                .iter()
-                .enumerate()
-                .map(|(idx, track)| self.view_track_item_in_playlist(track, playlist.clone(), idx))
-                .collect();
-
-            let mut tracks = widget::column::with_children(track_items).spacing(space_s);
-
-            // Load more button
-            if self.artist_tracks.next_href.is_some() {
-                tracks = tracks.push(widget::vertical_space().height(Length::Fixed(8.0)));
-                tracks = tracks.push(
-                    widget::button::text(if self.artist_tracks.loading {
-                        "Loading..."
-                    } else {
-                        "Load More"
-                    })
-                    .on_press_maybe(if self.artist_tracks.loading {
-                        None
-                    } else {
-                        Some(Message::LoadMoreArtistTracks)
-                    }),
-                );
-            }
-
-            widget::column::with_capacity(2)
-                .push(widget::text::title3("Tracks"))
-                .push(tracks)
-                .spacing(space_s)
+        // Tab content
+        let tab_content = match self.artist_tab {
+            ArtistTab::Albums => self.view_artist_albums(),
+            ArtistTab::Tracks => self.view_artist_tracks(),
         };
 
-        content = content.push(tracks_section);
+        let content = widget::column::with_capacity(3)
+            .push(header)
+            .push(tabs)
+            .push(tab_content)
+            .spacing(space_l)
+            .width(Length::Fill);
 
         // Add padding - right padding for scrollbar, bottom padding for player bar clearance
         let padded_content = widget::container(content)
@@ -1879,59 +1915,162 @@ impl AppModel {
             .into()
     }
 
-    /// View for an album card - clicking plays the album
-    fn view_album_card(&self, album: &Album) -> Element<'_, Message> {
+    /// View for the Albums tab on the artist page - grid layout with type filter
+    fn view_artist_albums(&self) -> Element<'_, Message> {
+        let space_m = cosmic::theme::spacing().space_m;
+
+        // Filter dropdown in the top-right
+        let selected_index = AlbumTypeFilter::all()
+            .iter()
+            .position(|f| *f == self.artist_album_filter);
+
+        let filter_dropdown = widget::dropdown(
+            AlbumTypeFilter::all_labels(),
+            selected_index,
+            Message::SetAlbumTypeFilter,
+        );
+
+        let filter_row = widget::row::with_capacity(2)
+            .push(widget::horizontal_space())
+            .push(filter_dropdown)
+            .align_y(Alignment::Center);
+
+        // Filter albums by selected type
+        let filtered_albums: Vec<&Album> = self
+            .artist_albums
+            .iter()
+            .filter(|album| album.track_count > 0)
+            .filter(|album| match self.artist_album_filter.set_type_value() {
+                Some(type_value) => album.set_type.as_deref() == Some(type_value),
+                None => true,
+            })
+            .collect();
+
+        if filtered_albums.is_empty() {
+            return widget::column::with_capacity(2)
+                .push(filter_row)
+                .push(widget::text::body("No albums found."))
+                .spacing(space_m)
+                .into();
+        }
+
+        // Grid of album cards - rows of 4
+        let mut rows: Vec<Element<_>> = Vec::new();
+        for chunk in filtered_albums.chunks(4) {
+            let mut row = widget::row::with_capacity(4).spacing(space_m);
+            for album in chunk {
+                row = row.push(self.view_album_grid_card(album));
+            }
+            for _ in chunk.len()..4 {
+                row = row.push(widget::horizontal_space());
+            }
+            rows.push(row.into());
+        }
+
+        let grid = widget::column::with_children(rows).spacing(space_m);
+
+        widget::column::with_capacity(2)
+            .push(filter_row)
+            .push(grid)
+            .spacing(space_m)
+            .into()
+    }
+
+    /// View for a single album card in the grid layout
+    fn view_album_grid_card(&self, album: &Album) -> Element<'_, Message> {
         let space_s = cosmic::theme::spacing().space_s;
         let album_id = album.id;
 
         let artwork: Element<_> = if let Some(artwork_url) = &album.artwork_url {
             if let Some(handle) = self.artwork_cache.get(artwork_url) {
                 widget::image(handle.clone())
-                    .width(Length::Fixed(80.0))
-                    .height(Length::Fixed(80.0))
+                    .width(Length::Fixed(120.0))
+                    .height(Length::Fixed(120.0))
                     .content_fit(cosmic::iced::ContentFit::Cover)
                     .into()
             } else {
                 widget::icon::from_name("folder-music-symbolic")
-                    .size(80)
+                    .size(120)
                     .apply(Element::from)
             }
         } else {
             widget::icon::from_name("folder-music-symbolic")
-                .size(80)
+                .size(120)
                 .apply(Element::from)
         };
 
-        // Clone values to avoid lifetime issues - limit to ~3 lines
         let title_text = album.title.clone();
-        let title = widget::container(widget::text::body(title_text).width(Length::Fixed(80.0)))
-            .max_height(54.0)
-            .clip(true);
+        let title = widget::container(
+            widget::text::body(title_text).width(Length::Fixed(120.0)),
+        )
+        .max_height(54.0)
+        .clip(true);
 
-        let release_info: Element<_> = if let Some(release_date) = &album.release_date {
-            // Extract year from date string (e.g., "2024-01-15" -> "2024")
-            let year = release_date
-                .split('-')
-                .next()
-                .unwrap_or(release_date)
-                .to_string();
-            widget::text::caption(year).into()
+        // Subtitle: "2024 · 12 tracks"
+        let subtitle_text = if let Some(release_date) = &album.release_date {
+            let year = release_date.split('-').next().unwrap_or(release_date);
+            format!("{year} · {} tracks", album.track_count)
         } else {
-            widget::text::caption(format!("{} tracks", album.track_count)).into()
+            format!("{} tracks", album.track_count)
         };
+        let subtitle = widget::text::caption(subtitle_text);
 
         let card_content = widget::column::with_capacity(3)
             .push(artwork)
             .push(title)
-            .push(release_info)
-            .spacing(space_s);
+            .push(subtitle)
+            .spacing(space_s)
+            .width(Length::Fixed(120.0));
 
-        // Wrap in a button to make clickable
         widget::button::custom(card_content)
             .on_press(Message::PlayAlbum(album_id))
             .class(cosmic::theme::Button::Text)
             .padding(space_s)
             .into()
+    }
+
+    /// View for the Tracks tab on the artist page - same design as library track listing
+    fn view_artist_tracks(&self) -> Element<'_, Message> {
+        let space_s = cosmic::theme::spacing().space_s;
+
+        if self.artist_tracks.items.is_empty() && self.artist_tracks.loading {
+            return self.view_loading("Loading tracks...");
+        }
+
+        if self.artist_tracks.items.is_empty() {
+            return widget::text::body("No tracks found.").into();
+        }
+
+        // Clone the full track list for playlist context
+        let playlist = self.artist_tracks.items.clone();
+        let track_items: Vec<Element<_>> = self
+            .artist_tracks
+            .items
+            .iter()
+            .enumerate()
+            .map(|(idx, track)| self.view_track_item_in_playlist(track, playlist.clone(), idx))
+            .collect();
+
+        let mut tracks = widget::column::with_children(track_items).spacing(space_s);
+
+        // Load more button
+        if self.artist_tracks.next_href.is_some() {
+            tracks = tracks.push(widget::vertical_space().height(Length::Fixed(8.0)));
+            tracks = tracks.push(
+                widget::button::text(if self.artist_tracks.loading {
+                    "Loading..."
+                } else {
+                    "Load More"
+                })
+                .on_press_maybe(if self.artist_tracks.loading {
+                    None
+                } else {
+                    Some(Message::LoadMoreArtistTracks)
+                }),
+            );
+        }
+
+        tracks.into()
     }
 
     fn view_library(&self) -> Element<'_, Message> {

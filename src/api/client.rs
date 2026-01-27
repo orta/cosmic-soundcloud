@@ -217,6 +217,36 @@ impl SoundCloudClient {
         Ok((tracks.collection, tracks.next_href))
     }
 
+    /// Fetch full track details for multiple track IDs in batches
+    pub async fn get_tracks_by_ids(&self, ids: &[u64]) -> Result<Vec<Track>, ApiError> {
+        let mut all_tracks = Vec::with_capacity(ids.len());
+
+        for chunk in ids.chunks(50) {
+            let ids_param: String = chunk
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let url = self.url_with_client_id(&format!("/tracks?ids={ids_param}"));
+
+            let response = self
+                .http
+                .get(&url)
+                .header("Authorization", self.auth_header())
+                .send()
+                .await?;
+
+            if response.status() == 401 {
+                return Err(ApiError::Unauthorized);
+            }
+
+            let tracks: Vec<Track> = response.json().await?;
+            all_tracks.extend(tracks);
+        }
+
+        Ok(all_tracks)
+    }
+
     /// Get tracks from a playlist/album
     pub async fn get_playlist_tracks(&self, playlist_id: u64) -> Result<Vec<Track>, ApiError> {
         let url = self.url_with_client_id(&format!("/playlists/{playlist_id}"));
@@ -236,30 +266,55 @@ impl SoundCloudClient {
             return Err(ApiError::NotFound);
         }
 
-        // Get raw text to debug
         let text = response.text().await?;
-        eprintln!("[api] Playlist response (first 500 chars): {}", &text[..text.len().min(500)]);
-
         let playlist: super::types::PlaylistWithTracks = serde_json::from_str(&text)
             .map_err(|e| {
                 eprintln!("[api] JSON parse error: {e}");
                 ApiError::Json(e.to_string())
             })?;
 
-        // Filter out stub tracks (those missing title/user data)
-        let complete_tracks: Vec<Track> = playlist
-            .tracks
-            .into_iter()
-            .filter(|t| t.is_complete())
-            .collect();
+        // Separate complete and stub tracks, preserving original order
+        let mut complete_by_id: std::collections::HashMap<u64, Track> = std::collections::HashMap::new();
+        let mut stub_ids: Vec<u64> = Vec::new();
+        let track_order: Vec<u64> = playlist.tracks.iter().map(|t| t.id).collect();
+
+        for track in playlist.tracks {
+            if track.is_complete() {
+                complete_by_id.insert(track.id, track);
+            } else {
+                stub_ids.push(track.id);
+            }
+        }
 
         eprintln!(
-            "[api] Playlist has {} complete tracks (out of {} total)",
-            complete_tracks.len(),
+            "[api] Playlist has {} complete, {} stub tracks (out of {} total)",
+            complete_by_id.len(),
+            stub_ids.len(),
             playlist.track_count
         );
 
-        Ok(complete_tracks)
+        // Fetch full data for stub tracks
+        if !stub_ids.is_empty() {
+            match self.get_tracks_by_ids(&stub_ids).await {
+                Ok(resolved) => {
+                    for track in resolved {
+                        complete_by_id.insert(track.id, track);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[api] Failed to resolve stub tracks: {e}");
+                }
+            }
+        }
+
+        // Reassemble in original order
+        let tracks: Vec<Track> = track_order
+            .into_iter()
+            .filter_map(|id| complete_by_id.remove(&id))
+            .collect();
+
+        eprintln!("[api] Returning {} tracks", tracks.len());
+        Ok(tracks)
     }
 
     /// Search for users/artists

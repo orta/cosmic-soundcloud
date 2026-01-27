@@ -15,6 +15,8 @@ A native SoundCloud client for the COSMIC desktop environment.
 
 ![Artist Page](images/artist.png)
 
+Note: these are old, it does more now.
+
 ### Install via Flatpak
 
 ```bash

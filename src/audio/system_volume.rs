@@ -41,10 +41,3 @@ pub fn set_volume(volume: f32) -> bool {
         .is_ok_and(|s| s.success())
 }
 
-/// Check if system volume control is available
-pub fn is_available() -> bool {
-    Command::new("pactl")
-        .arg("--version")
-        .output()
-        .is_ok_and(|o| o.status.success())
-}
