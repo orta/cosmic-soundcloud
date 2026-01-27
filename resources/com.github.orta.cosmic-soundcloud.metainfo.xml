@@ -35,6 +35,11 @@
   </keywords>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="0.4.0" date="2026-01-27">
+      <description>
+        <p>Focused on the album section of an artist, removes dupers</p>
+      </description>
+    </release>
     <release version="0.3.1" date="2026-01-16">
       <description>
         <p>Try deploy with GPG</p>
