@@ -1,4 +1,4 @@
-# Cosmic Soundcloud
+#  SoundCloud for COSMIC
 
 A native SoundCloud client for the COSMIC desktop environment.
 

@@ -1,6 +1,6 @@
 [Desktop Entry]
-Name=Cosmic Soundcloud
-Comment=Soundcloud for COSMIC folks
+Name=SoundCloud for COSMIC
+Comment=Lets you use your SoundCloud subscription
 Type=Application
 Icon=com.github.orta.cosmic-soundcloud
 Exec=cosmic-soundcloud %F

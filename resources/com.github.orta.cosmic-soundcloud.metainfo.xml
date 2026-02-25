@@ -3,7 +3,7 @@
   <id>com.github.orta.cosmic-soundcloud</id>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>MPL-2.0</project_license>
-  <name>COSMIC SoundCloud</name>
+  <name>SoundCloud for COSMIC</name>
   <summary>SoundCloud for COSMIC folks</summary>
   <description>
     <p>A SoundCloud client for the COSMIC desktop environment. Not perfect, or feature complete, but a reasonable start</p>

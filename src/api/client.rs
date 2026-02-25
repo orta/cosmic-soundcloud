@@ -123,6 +123,38 @@ impl SoundCloudClient {
         Ok((tracks, likes.next_href))
     }
 
+    /// Like a track (add to user's likes)
+    pub async fn like_track(&self, track_id: u64) -> Result<(), ApiError> {
+        let url = self.url_with_client_id(&format!("/me/track_likes/{track_id}"));
+        let response = self
+            .http
+            .put(&url)
+            .header("Authorization", self.auth_header())
+            .send()
+            .await?;
+
+        if response.status() == 401 {
+            return Err(ApiError::Unauthorized);
+        }
+        Ok(())
+    }
+
+    /// Unlike a track (remove from user's likes)
+    pub async fn unlike_track(&self, track_id: u64) -> Result<(), ApiError> {
+        let url = self.url_with_client_id(&format!("/me/track_likes/{track_id}"));
+        let response = self
+            .http
+            .delete(&url)
+            .header("Authorization", self.auth_header())
+            .send()
+            .await?;
+
+        if response.status() == 401 {
+            return Err(ApiError::Unauthorized);
+        }
+        Ok(())
+    }
+
     /// Get user's listening history
     pub async fn get_history(
         &self,

@@ -266,6 +266,7 @@ pub struct AppModel {
     current_tab: LibraryTab,
     tab_model: segmented_button::SingleSelectModel,
     likes: PaginatedData<Track>,
+    liked_track_ids: HashSet<u64>,
     history: PaginatedData<Track>,
 
     // === Audio Player State ===
@@ -326,6 +327,8 @@ pub enum Message {
     LoadMoreLikes,
     LikesLoaded(Result<(Vec<Track>, Option<String>), String>),
     LikesScrolled(cosmic::iced_widget::scrollable::Viewport),
+    ToggleLike(u64),
+    LikeResult(u64, bool, Result<(), String>),
 
     // History
     LoadHistory,
@@ -488,6 +491,7 @@ impl cosmic::Application for AppModel {
             current_tab: LibraryTab::default(),
             tab_model,
             likes: PaginatedData::default(),
+            liked_track_ids: HashSet::new(),
             history: PaginatedData::default(),
             audio_cmd_tx: None,
             playback_status: PlaybackStatus::Stopped,
@@ -859,6 +863,7 @@ impl cosmic::Application for AppModel {
                             .filter(|url| !self.artwork_cache.contains_key(url) && !self.artwork_loading.contains(url))
                             .collect();
 
+                        self.liked_track_ids.extend(tracks.iter().map(|t| t.id));
                         self.likes.items.extend(tracks);
                         self.likes.next_href = next_href;
 
@@ -885,6 +890,40 @@ impl cosmic::Application for AppModel {
                     && !self.likes.loading
                 {
                     return cosmic::task::message(cosmic::Action::App(Message::LoadMoreLikes));
+                }
+            }
+
+            Message::ToggleLike(track_id) => {
+                if let Some(client) = &self.api_client {
+                    let client = client.clone();
+                    let was_liked = self.liked_track_ids.contains(&track_id);
+                    // Optimistic toggle
+                    if was_liked {
+                        self.liked_track_ids.remove(&track_id);
+                    } else {
+                        self.liked_track_ids.insert(track_id);
+                    }
+                    return cosmic::task::future(async move {
+                        let result = if was_liked {
+                            client.unlike_track(track_id).await
+                        } else {
+                            client.like_track(track_id).await
+                        };
+                        Message::LikeResult(track_id, !was_liked, result.map_err(|e| e.to_string()))
+                    })
+                    .map(cosmic::Action::App);
+                }
+            }
+
+            Message::LikeResult(track_id, was_like, result) => {
+                if let Err(err) = result {
+                    eprintln!("Failed to toggle like for track {track_id}: {err}");
+                    // Revert optimistic toggle
+                    if was_like {
+                        self.liked_track_ids.remove(&track_id);
+                    } else {
+                        self.liked_track_ids.insert(track_id);
+                    }
                 }
             }
 
@@ -1808,7 +1847,23 @@ impl AppModel {
             _ => "media-playback-start-symbolic",
         };
 
-        let controls = widget::row::with_capacity(3)
+        let like_button: Element<_> = if let Some(track) = &self.current_track {
+            let track_id = track.id;
+            let is_liked = self.liked_track_ids.contains(&track_id);
+            let icon_name = if is_liked {
+                "starred-symbolic"
+            } else {
+                "non-starred-symbolic"
+            };
+            widget::button::icon(widget::icon::from_name(icon_name))
+                .on_press(Message::ToggleLike(track_id))
+                .class(cosmic::theme::Button::Text)
+                .into()
+        } else {
+            widget::horizontal_space().width(Length::Shrink).into()
+        };
+
+        let controls = widget::row::with_capacity(4)
             .push(
                 widget::button::icon(widget::icon::from_name("media-skip-backward-symbolic"))
                     .on_press(Message::PreviousTrack),
@@ -1822,6 +1877,7 @@ impl AppModel {
                 widget::button::icon(widget::icon::from_name("media-skip-forward-symbolic"))
                     .on_press(Message::NextTrack),
             )
+            .push(like_button)
             .spacing(space_s)
             .align_y(Alignment::Center);
 
@@ -1936,7 +1992,7 @@ impl AppModel {
         let space_l = cosmic::theme::spacing().space_l;
 
         let content = widget::column::with_capacity(5)
-            .push(widget::text::title1("Welcome to COSMIC SoundCloud"))
+            .push(widget::text::title1("Welcome to SoundCloud for COSMIC"))
             .push(widget::vertical_space().height(Length::Fixed(space_l as f32)))
             .push(widget::text::body(
                 "Enter your SoundCloud OAuth token to get started.\n\

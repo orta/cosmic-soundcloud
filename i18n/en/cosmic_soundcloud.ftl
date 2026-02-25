@@ -1,4 +1,4 @@
-app-title = COSMIC SoundCloud
+app-title = SoundCloud for COSMIC
 about = About
 repository = Repository
 view = View
@@ -6,7 +6,7 @@ library = Library
 search = Search
 recommendations = Recommendations
 recent-artists = Recent Artists
-welcome = Welcome to COSMIC SoundCloud!
+welcome = Welcome to SoundCloud for COSMIC!
 page-id = Page { $num }
 git-description = Git commit {$hash} on {$date}
 search-artists = Search for artists...
