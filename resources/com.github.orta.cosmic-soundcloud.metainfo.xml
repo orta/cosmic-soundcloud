@@ -35,6 +35,11 @@
   </keywords>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="0.5.0" date="2026-03-18">
+      <description>
+        <p>Adds Rocksky scrobbling</p>
+      </description>
+    </release>
     <release version="0.4.2" date="2026-02-25">
       <description>
         <p>Adds the ability to like/unlike a song</p>
