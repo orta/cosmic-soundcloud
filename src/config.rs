@@ -35,6 +35,12 @@ pub struct Config {
     pub repeat_mode: RepeatMode,
     /// Recently viewed artists (max 10)
     pub recent_artists: Vec<RecentArtist>,
+    /// Rocksky API key
+    pub rocksky_api_key: Option<String>,
+    /// Rocksky shared secret (used for signature generation)
+    pub rocksky_shared_secret: Option<String>,
+    /// Rocksky session key (sk)
+    pub rocksky_session_key: Option<String>,
 }
 
 impl Default for Config {
@@ -45,6 +51,9 @@ impl Default for Config {
             shuffle: false,
             repeat_mode: RepeatMode::None,
             recent_artists: Vec::new(),
+            rocksky_api_key: None,
+            rocksky_shared_secret: None,
+            rocksky_session_key: None,
         }
     }
 }

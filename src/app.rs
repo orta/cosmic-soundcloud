@@ -5,6 +5,7 @@ use crate::audio::{open_in_browser, system_volume, AudioCommand, AudioEvent, Aud
 use crate::config::{Config, RecentArtist};
 use crate::fl;
 use crate::keyring;
+use crate::rocksky;
 use cosmic::app::context_drawer;
 use cosmic::cosmic_config::{self, CosmicConfigEntry};
 use cosmic::iced::alignment::{Horizontal, Vertical};
@@ -303,6 +304,16 @@ pub struct AppModel {
     // === Recommendations Page State ===
     recommendations: Vec<Playlist>,
     recommendations_loading: bool,
+
+    // === Rocksky Scrobbling ===
+    /// Stored credentials: (api_key, shared_secret, session_key)
+    rocksky_credentials: Option<(String, String, String)>,
+    rocksky_api_key_input: String,
+    rocksky_shared_secret_input: String,
+    rocksky_session_key_input: String,
+    rocksky_http_client: reqwest::Client,
+    /// Feedback message shown after a save attempt
+    rocksky_save_message: Option<String>,
 }
 
 /// Messages emitted by the application and its widgets.
@@ -381,6 +392,14 @@ pub enum Message {
     LoadRecommendations,
     RecommendationsLoaded(Result<Vec<Playlist>, String>),
     PlayPlaylist(u64),
+
+    // Rocksky scrobbling settings
+    RockskyApiKeyInput(String),
+    RockskySharedSecretInput(String),
+    RockskySessionKeyInput(String),
+    SaveRockskyCredentials,
+    ClearRockskyCredentials,
+    RockskyScrobbleResult(Result<(), String>),
 }
 
 /// Create a COSMIC application from the app model
@@ -478,6 +497,16 @@ impl cosmic::Application for AppModel {
             }
         };
 
+        // Extract Rocksky values before config is moved into AppModel
+        let rocksky_credentials = match (&config.rocksky_api_key, &config.rocksky_shared_secret, &config.rocksky_session_key) {
+            (Some(k), Some(s), Some(sk)) if !k.is_empty() && !s.is_empty() && !sk.is_empty() =>
+                Some((k.clone(), s.clone(), sk.clone())),
+            _ => None,
+        };
+        let rocksky_api_key_input = config.rocksky_api_key.clone().unwrap_or_default();
+        let rocksky_shared_secret_input = config.rocksky_shared_secret.clone().unwrap_or_default();
+        let rocksky_session_key_input = config.rocksky_session_key.clone().unwrap_or_default();
+
         let mut app = AppModel {
             core,
             context_page: ContextPage::default(),
@@ -525,6 +554,13 @@ impl cosmic::Application for AppModel {
             // Recommendations page state
             recommendations: Vec::new(),
             recommendations_loading: false,
+            // Rocksky scrobbling — loaded from persistent config
+            rocksky_credentials,
+            rocksky_api_key_input,
+            rocksky_shared_secret_input,
+            rocksky_session_key_input,
+            rocksky_http_client: reqwest::Client::new(),
+            rocksky_save_message: None,
         };
 
         // Rebuild nav to include recent artists from config
@@ -606,6 +642,11 @@ impl cosmic::Application for AppModel {
                 Message::ToggleContextPage(ContextPage::Queue),
             )
             .title(fl!("queue")),
+            ContextPage::RockskySettings => context_drawer::context_drawer(
+                self.view_rocksky_settings(),
+                Message::ToggleContextPage(ContextPage::RockskySettings),
+            )
+            .title(fl!("rocksky-settings")),
         })
     }
 
@@ -997,6 +1038,33 @@ impl cosmic::Application for AppModel {
 
                 // Load artwork if not cached
                 let mut tasks = Vec::new();
+
+                // Scrobble to Rocksky if configured
+                if let Some((api_key, shared_secret, session_key)) = &self.rocksky_credentials {
+                    let http_client = self.rocksky_http_client.clone();
+                    let api_key = api_key.clone();
+                    let shared_secret = shared_secret.clone();
+                    let session_key = session_key.clone();
+                    let artist = track.user.username.clone();
+                    let track_title = track.title.clone();
+                    let timestamp = rocksky::current_timestamp();
+                    tasks.push(
+                        cosmic::task::future(async move {
+                            let result = rocksky::scrobble(
+                                &http_client,
+                                &api_key,
+                                &shared_secret,
+                                &session_key,
+                                &artist,
+                                &track_title,
+                                timestamp,
+                            )
+                            .await;
+                            Message::RockskyScrobbleResult(result)
+                        })
+                        .map(cosmic::Action::App),
+                    );
+                }
                 if let Some(artwork_url) = &track.artwork_url
                     && !self.artwork_cache.contains_key(artwork_url)
                     && !self.artwork_loading.contains(artwork_url)
@@ -1635,6 +1703,53 @@ impl cosmic::Application for AppModel {
                 // Reuse the album/playlist loading logic
                 return cosmic::task::message(cosmic::Action::App(Message::PlayAlbum(playlist_id)));
             }
+
+            // === Rocksky Settings ===
+            Message::RockskyApiKeyInput(input) => {
+                self.rocksky_api_key_input = input;
+            }
+            Message::RockskySharedSecretInput(input) => {
+                self.rocksky_shared_secret_input = input;
+            }
+            Message::RockskySessionKeyInput(input) => {
+                self.rocksky_session_key_input = input;
+            }
+            Message::SaveRockskyCredentials => {
+                let api_key = self.rocksky_api_key_input.trim().to_string();
+                let shared_secret = self.rocksky_shared_secret_input.trim().to_string();
+                let session_key = self.rocksky_session_key_input.trim().to_string();
+                if api_key.is_empty() || shared_secret.is_empty() || session_key.is_empty() {
+                    self.rocksky_save_message = Some(fl!("rocksky-fields-required"));
+                } else {
+                    self.config.rocksky_api_key = Some(api_key.clone());
+                    self.config.rocksky_shared_secret = Some(shared_secret.clone());
+                    self.config.rocksky_session_key = Some(session_key.clone());
+                    if let Ok(ctx) = cosmic_config::Config::new(Self::APP_ID, Config::VERSION) {
+                        let _ = self.config.write_entry(&ctx);
+                    }
+                    self.rocksky_credentials = Some((api_key, shared_secret, session_key));
+                    self.rocksky_save_message = Some(fl!("rocksky-save-success"));
+                    eprintln!("[rocksky] Credentials saved to config");
+                }
+            }
+            Message::ClearRockskyCredentials => {
+                self.config.rocksky_api_key = None;
+                self.config.rocksky_shared_secret = None;
+                self.config.rocksky_session_key = None;
+                if let Ok(ctx) = cosmic_config::Config::new(Self::APP_ID, Config::VERSION) {
+                    let _ = self.config.write_entry(&ctx);
+                }
+                self.rocksky_credentials = None;
+                self.rocksky_api_key_input.clear();
+                self.rocksky_shared_secret_input.clear();
+                self.rocksky_session_key_input.clear();
+                self.rocksky_save_message = None;
+            }
+            Message::RockskyScrobbleResult(result) => {
+                if let Err(e) = result {
+                    eprintln!("[rocksky] Scrobble failed: {e}");
+                }
+            }
         }
         Task::none()
     }
@@ -1949,6 +2064,17 @@ impl AppModel {
                 widget::button::icon(widget::icon::from_name("view-list-symbolic"))
                     .on_press(Message::ToggleContextPage(ContextPage::Queue))
                     .class(if self.context_page == ContextPage::Queue && self.core.window.show_context {
+                        cosmic::theme::Button::Suggested
+                    } else {
+                        cosmic::theme::Button::Standard
+                    }),
+            )
+            .push(
+                widget::button::icon(widget::icon::from_name("preferences-system-symbolic"))
+                    .on_press(Message::ToggleContextPage(ContextPage::RockskySettings))
+                    .class(if self.context_page == ContextPage::RockskySettings && self.core.window.show_context {
+                        cosmic::theme::Button::Suggested
+                    } else if self.rocksky_credentials.is_some() {
                         cosmic::theme::Button::Suggested
                     } else {
                         cosmic::theme::Button::Standard
@@ -2895,6 +3021,71 @@ impl AppModel {
         .height(Length::Fill)
         .into()
     }
+
+    /// View for the Rocksky scrobbling settings drawer
+    fn view_rocksky_settings(&self) -> Element<'_, Message> {
+        let space_m = cosmic::theme::spacing().space_m;
+        let space_s = cosmic::theme::spacing().space_s;
+
+        let status: Element<_> = widget::text::body(if self.rocksky_credentials.is_some() {
+            fl!("rocksky-configured")
+        } else {
+            fl!("rocksky-not-configured")
+        })
+        .into();
+
+        let mut col = widget::column::with_capacity(10)
+            .spacing(space_s)
+            .padding([space_m, space_m]);
+
+        col = col
+            .push(status)
+            .push(widget::vertical_space().height(Length::Fixed(space_s as f32)))
+            .push(widget::text::caption(fl!("rocksky-intro")))
+            .push(widget::vertical_space().height(Length::Fixed(space_s as f32)))
+            .push(widget::text::heading(fl!("rocksky-api-key")))
+            .push(widget::text::caption(fl!("rocksky-api-key-hint")))
+            .push(
+                widget::text_input("", &self.rocksky_api_key_input)
+                    .on_input(Message::RockskyApiKeyInput)
+                    .password()
+                    .width(Length::Fill),
+            )
+            .push(widget::text::heading(fl!("rocksky-shared-secret")))
+            .push(widget::text::caption(fl!("rocksky-shared-secret-hint")))
+            .push(
+                widget::text_input("", &self.rocksky_shared_secret_input)
+                    .on_input(Message::RockskySharedSecretInput)
+                    .password()
+                    .width(Length::Fill),
+            )
+            .push(widget::text::heading(fl!("rocksky-session-key")))
+            .push(widget::text::caption(fl!("rocksky-session-key-hint")))
+            .push(
+                widget::text_input("", &self.rocksky_session_key_input)
+                    .on_input(Message::RockskySessionKeyInput)
+                    .password()
+                    .width(Length::Fill),
+            )
+            .push(widget::vertical_space().height(Length::Fixed(space_s as f32)))
+            .push(
+                widget::button::suggested(fl!("rocksky-save"))
+                    .on_press(Message::SaveRockskyCredentials),
+            );
+
+        if let Some(msg) = &self.rocksky_save_message {
+            col = col.push(widget::text::caption(msg.as_str()));
+        }
+
+        if self.rocksky_credentials.is_some() {
+            col = col.push(
+                widget::button::destructive(fl!("rocksky-clear"))
+                    .on_press(Message::ClearRockskyCredentials),
+            );
+        }
+
+        col.into()
+    }
 }
 
 /// The context page to display in the context drawer.
@@ -2904,6 +3095,8 @@ pub enum ContextPage {
     About,
     /// Shows upcoming tracks in the current playlist
     Queue,
+    /// Rocksky scrobbling settings
+    RockskySettings,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

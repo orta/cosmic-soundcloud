@@ -71,3 +71,54 @@ pub fn delete_token() -> Result<(), keyring::Error> {
         Err(e) => Err(e),
     }
 }
+
+// === Rocksky credentials ===
+
+const ROCKSKY_API_KEY: &str = "rocksky_api_key";
+const ROCKSKY_SHARED_SECRET: &str = "rocksky_shared_secret";
+const ROCKSKY_SESSION_KEY: &str = "rocksky_session_key";
+
+/// Store Rocksky credentials in the system keyring
+pub fn store_rocksky_credentials(
+    api_key: &str,
+    shared_secret: &str,
+    session_key: &str,
+) -> Result<(), keyring::Error> {
+    Entry::new(SERVICE_NAME, ROCKSKY_API_KEY)?.set_password(api_key)?;
+    Entry::new(SERVICE_NAME, ROCKSKY_SHARED_SECRET)?.set_password(shared_secret)?;
+    Entry::new(SERVICE_NAME, ROCKSKY_SESSION_KEY)?.set_password(session_key)?;
+    Ok(())
+}
+
+/// Retrieve Rocksky credentials from the system keyring.
+/// Returns None if any credential is missing.
+pub fn get_rocksky_credentials() -> Result<Option<(String, String, String)>, keyring::Error> {
+    let api_key = match Entry::new(SERVICE_NAME, ROCKSKY_API_KEY)?.get_password() {
+        Ok(v) => v,
+        Err(keyring::Error::NoEntry) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let shared_secret = match Entry::new(SERVICE_NAME, ROCKSKY_SHARED_SECRET)?.get_password() {
+        Ok(v) => v,
+        Err(keyring::Error::NoEntry) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let session_key = match Entry::new(SERVICE_NAME, ROCKSKY_SESSION_KEY)?.get_password() {
+        Ok(v) => v,
+        Err(keyring::Error::NoEntry) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    Ok(Some((api_key, shared_secret, session_key)))
+}
+
+/// Delete Rocksky credentials from the system keyring
+pub fn delete_rocksky_credentials() -> Result<(), keyring::Error> {
+    for key in [ROCKSKY_API_KEY, ROCKSKY_SHARED_SECRET, ROCKSKY_SESSION_KEY] {
+        let entry = Entry::new(SERVICE_NAME, key)?;
+        match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
